@@ -1,0 +1,4 @@
+interface:
+  display_name: "Journal Alert to Notion"
+  short_description: "Ingest verified Gmail journal alert papers to Notion with anti-bot-aware extraction."
+  default_prompt: "Use $journal-alert-to-notion to process a Gmail journal alert, verify each paper on the publisher site (including anti-bot protected pages), and add accurate entries to my Notion database."

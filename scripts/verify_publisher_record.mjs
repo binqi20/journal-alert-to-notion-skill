@@ -1,0 +1,1679 @@
+#!/usr/bin/env node
+/**
+ * Verify paper metadata from publisher/DOI pages with domain-aware policy and
+ * anti-bot challenge handling.
+ *
+ * Output JSON is designed to feed build_notion_payload.py.
+ */
+
+import fs from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+import { execFile } from "node:child_process";
+
+const DEFAULT_TIMEOUT_MS = 45_000;
+const DEFAULT_RETRIES = 3;
+const DEFAULT_CONCURRENCY = 2;
+const DEFAULT_CHALLENGE_WAIT_MS = 45_000;
+const DEFAULT_CHALLENGE_POLL_MS = 3_000;
+const DEFAULT_TRACKING_TIMEOUT_MS = 20_000;
+const DEFAULT_SCIENCEDIRECT_MODE = "auto";
+const CURL_MAX_BUFFER_BYTES = 50 * 1024 * 1024;
+const CURL_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+const DOMAIN_POLICIES = [
+  {
+    name: "informs",
+    hostPattern: /(^|\.)pubsonline\.informs\.org$/i,
+    protected: true,
+    abstractSelectors: [
+      "section.abstract",
+      "#abstract",
+      "div.abstractSection",
+      "div.hlFld-Abstract",
+      "div.NLM_abstract",
+    ],
+  },
+  {
+    name: "sage",
+    hostPattern: /(^|\.)journals\.sagepub\.com$/i,
+    protected: true,
+    abstractSelectors: [
+      "section.abstract",
+      "#abstract",
+      "div.abstractSection",
+      "div.articeBody_abstract",
+    ],
+  },
+  {
+    name: "wiley",
+    hostPattern: /(^|\.)onlinelibrary\.wiley\.com$/i,
+    protected: true,
+    abstractSelectors: ["section.article-section__abstract", "section.abstract", "#abstract"],
+  },
+  {
+    name: "sciencedirect",
+    hostPattern: /(^|\.)sciencedirect\.com$/i,
+    protected: true,
+    abstractSelectors: ["#abstracts", ".Abstracts", "section.abstract"],
+  },
+  {
+    name: "oup",
+    hostPattern: /(^|\.)academic\.oup\.com$/i,
+    protected: true,
+    abstractSelectors: [
+      "section.abstract p",
+      "section.abstract",
+      "div.abstract",
+      'section[data-widgetname="ArticleFulltext"] section.abstract',
+    ],
+  },
+  {
+    name: "doi",
+    hostPattern: /(^|\.)doi\.org$/i,
+    protected: false,
+    abstractSelectors: ["section.abstract", "#abstract", "div.abstract", ".abstract"],
+  },
+  {
+    name: "default",
+    hostPattern: /.*/,
+    protected: false,
+    abstractSelectors: ["section.abstract", "#abstract", "div.abstract", ".abstract"],
+  },
+];
+
+const CHALLENGE_TERMS = [
+  "just a moment",
+  "attention required",
+  "access denied",
+  "verify you are human",
+  "cf-ray",
+  "cloudflare",
+  "/cdn-cgi/",
+  "security check",
+];
+
+const TRACKING_HOST_PATTERNS = [
+  /(^|\.)click\.skem1\.com$/i,
+  /(^|\.)lnk\.springernature\.com$/i,
+  /(^|\.)link\.mail\.elsevier\.com$/i,
+  /(^|\.)click\.notification\.elsevier\.com$/i,
+];
+
+const INCLUDE_ARTICLE_TYPES = new Set(["research-article", "research-paper", "editorial"]);
+const EXCLUDE_ARTICLE_TYPES = new Set([
+  "book-review",
+  "media-review",
+  "discussion",
+  "commentary",
+  "corrigendum",
+  "erratum",
+  "retraction",
+  "interview",
+  "call-for-papers",
+  "announcement",
+  "news",
+]);
+
+function usage() {
+  const script = path.basename(process.argv[1] || "verify_publisher_record.mjs");
+  console.error(`Usage:
+  ${script} --url <url> [--url <url> ...] [options]
+  ${script} --input <records.json> [options]
+
+Options:
+  --url <url>                  Single URL input (repeatable)
+  --input <json-file>          JSON file with URLs/records
+  --output <json-file>         Write JSON output to file
+  --concurrency <n>            Concurrent workers (default: ${DEFAULT_CONCURRENCY})
+  --max-retries <n>            Retries per URL (default: ${DEFAULT_RETRIES})
+  --timeout-ms <n>             Timeout per page load (default: ${DEFAULT_TIMEOUT_MS})
+  --challenge-wait-ms <n>      Max wait for anti-bot challenge to clear (default: ${DEFAULT_CHALLENGE_WAIT_MS})
+  --challenge-poll-ms <n>      Poll interval while waiting for challenge clear (default: ${DEFAULT_CHALLENGE_POLL_MS})
+  --tracking-timeout-ms <n>    Timeout for tracked-link resolution (default: ${DEFAULT_TRACKING_TIMEOUT_MS})
+  --sciencedirect-mode <mode>  ScienceDirect strategy: auto|curl|browser (default: ${DEFAULT_SCIENCEDIRECT_MODE})
+  --skip-tracking-resolution    Do not pre-resolve tracked links (e.g. click.skem1.com)
+  --cdp-url <url>              Connect to existing Chrome via CDP
+  --channel <name>             Launch channel when not using CDP (default: chrome)
+  --headless                   Launch headless browser
+  --verbose                    Verbose stderr logs
+`);
+}
+
+function parseArgs(argv) {
+  const args = {
+    urls: [],
+    input: null,
+    output: null,
+    concurrency: DEFAULT_CONCURRENCY,
+    maxRetries: DEFAULT_RETRIES,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
+    challengePollMs: DEFAULT_CHALLENGE_POLL_MS,
+    trackingTimeoutMs: DEFAULT_TRACKING_TIMEOUT_MS,
+    sciencedirectMode: DEFAULT_SCIENCEDIRECT_MODE,
+    skipTrackingResolution: false,
+    cdpUrl: null,
+    channel: "chrome",
+    headless: false,
+    verbose: false,
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = argv[i + 1];
+    switch (arg) {
+      case "--url":
+        if (!next) throw new Error("--url requires a value");
+        args.urls.push(next);
+        i += 1;
+        break;
+      case "--input":
+        if (!next) throw new Error("--input requires a value");
+        args.input = next;
+        i += 1;
+        break;
+      case "--output":
+        if (!next) throw new Error("--output requires a value");
+        args.output = next;
+        i += 1;
+        break;
+      case "--concurrency":
+        if (!next) throw new Error("--concurrency requires a value");
+        args.concurrency = Number.parseInt(next, 10);
+        i += 1;
+        break;
+      case "--max-retries":
+        if (!next) throw new Error("--max-retries requires a value");
+        args.maxRetries = Number.parseInt(next, 10);
+        i += 1;
+        break;
+      case "--timeout-ms":
+        if (!next) throw new Error("--timeout-ms requires a value");
+        args.timeoutMs = Number.parseInt(next, 10);
+        i += 1;
+        break;
+      case "--challenge-wait-ms":
+        if (!next) throw new Error("--challenge-wait-ms requires a value");
+        args.challengeWaitMs = Number.parseInt(next, 10);
+        i += 1;
+        break;
+      case "--challenge-poll-ms":
+        if (!next) throw new Error("--challenge-poll-ms requires a value");
+        args.challengePollMs = Number.parseInt(next, 10);
+        i += 1;
+        break;
+      case "--tracking-timeout-ms":
+        if (!next) throw new Error("--tracking-timeout-ms requires a value");
+        args.trackingTimeoutMs = Number.parseInt(next, 10);
+        i += 1;
+        break;
+      case "--sciencedirect-mode":
+        if (!next) throw new Error("--sciencedirect-mode requires a value");
+        args.sciencedirectMode = String(next).toLowerCase();
+        i += 1;
+        break;
+      case "--skip-tracking-resolution":
+        args.skipTrackingResolution = true;
+        break;
+      case "--cdp-url":
+        if (!next) throw new Error("--cdp-url requires a value");
+        args.cdpUrl = next;
+        i += 1;
+        break;
+      case "--channel":
+        if (!next) throw new Error("--channel requires a value");
+        args.channel = next;
+        i += 1;
+        break;
+      case "--headless":
+        args.headless = true;
+        break;
+      case "--verbose":
+        args.verbose = true;
+        break;
+      case "-h":
+      case "--help":
+        usage();
+        process.exit(0);
+      default:
+        throw new Error(`Unknown argument: ${arg}`);
+    }
+  }
+  if (!args.urls.length && !args.input) {
+    throw new Error("Provide at least one --url or --input");
+  }
+  if (!Number.isFinite(args.concurrency) || args.concurrency < 1) {
+    throw new Error("--concurrency must be >= 1");
+  }
+  if (!Number.isFinite(args.maxRetries) || args.maxRetries < 1) {
+    throw new Error("--max-retries must be >= 1");
+  }
+  if (!Number.isFinite(args.timeoutMs) || args.timeoutMs < 1000) {
+    throw new Error("--timeout-ms must be >= 1000");
+  }
+  if (!Number.isFinite(args.challengeWaitMs) || args.challengeWaitMs < 0) {
+    throw new Error("--challenge-wait-ms must be >= 0");
+  }
+  if (!Number.isFinite(args.challengePollMs) || args.challengePollMs < 250) {
+    throw new Error("--challenge-poll-ms must be >= 250");
+  }
+  if (!Number.isFinite(args.trackingTimeoutMs) || args.trackingTimeoutMs < 1000) {
+    throw new Error("--tracking-timeout-ms must be >= 1000");
+  }
+  if (!["auto", "curl", "browser"].includes(args.sciencedirectMode)) {
+    throw new Error("--sciencedirect-mode must be one of: auto, curl, browser");
+  }
+  return args;
+}
+
+function log(message, enabled) {
+  if (enabled) {
+    process.stderr.write(`[verify_publisher_record] ${message}\n`);
+  }
+}
+
+function cleanText(value) {
+  if (!value) return "";
+  return String(value).replace(/\s+/g, " ").trim();
+}
+
+function pickFirst(...values) {
+  for (const v of values) {
+    const cleaned = cleanText(v);
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
+function isNotVerifiedValue(value) {
+  const cleaned = cleanText(value);
+  return !cleaned || cleaned.toLowerCase() === "[not verified]";
+}
+
+function normalizeDoi(doiOrUrl) {
+  if (!doiOrUrl) return "";
+  let raw = decodeURIComponent(String(doiOrUrl).trim());
+  raw = raw.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "");
+  raw = raw.replace(/^doi:\s*/i, "");
+  const match = raw.match(/10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i);
+  if (!match) return "";
+  const doi = match[0].replace(/[)\],.;\s]+$/g, "");
+  return `https://doi.org/${doi.toLowerCase()}`;
+}
+
+function extractDoiFromText(value) {
+  if (!value) return "";
+  const match = String(value).match(/10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i);
+  return match ? `https://doi.org/${match[0].replace(/[)\],.;\s]+$/g, "").toLowerCase()}` : "";
+}
+
+function policyForUrl(rawUrl) {
+  let host = "";
+  try {
+    host = new URL(rawUrl).hostname;
+  } catch {
+    host = "";
+  }
+  return DOMAIN_POLICIES.find((item) => item.hostPattern.test(host)) || DOMAIN_POLICIES.at(-1);
+}
+
+function hostForUrl(rawUrl) {
+  try {
+    return new URL(rawUrl).hostname || "";
+  } catch {
+    return "";
+  }
+}
+
+function isTrackingUrl(rawUrl) {
+  const host = hostForUrl(rawUrl);
+  return TRACKING_HOST_PATTERNS.some((pattern) => pattern.test(host));
+}
+
+function maybeCanonicalArticleUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.pathname.includes("/advance-article/doi/") || u.pathname.includes("/article/doi/")) {
+      return `${u.origin}${u.pathname}`;
+    }
+    return rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
+
+async function resolveTrackedUrl(inputUrl, args) {
+  if (args.skipTrackingResolution || !isTrackingUrl(inputUrl)) {
+    return {
+      inputUrl,
+      resolvedUrl: inputUrl,
+      usedTrackingResolution: false,
+      trackingResolutionError: "",
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), args.trackingTimeoutMs);
+    const response = await fetch(inputUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      },
+    });
+    clearTimeout(timer);
+    const resolvedUrl = maybeCanonicalArticleUrl(response.url || inputUrl);
+    return {
+      inputUrl,
+      resolvedUrl,
+      usedTrackingResolution: true,
+      trackingStatus: response.status,
+      trackingResolutionError: "",
+    };
+  } catch (error) {
+    return {
+      inputUrl,
+      resolvedUrl: inputUrl,
+      usedTrackingResolution: true,
+      trackingResolutionError: String(error?.message || error),
+    };
+  }
+}
+
+function parseYear(value) {
+  const m = String(value || "").match(/\b(19|20)\d{2}\b/);
+  return m ? m[0] : "";
+}
+
+function formatApaAuthor(name) {
+  const cleaned = cleanText(name);
+  if (!cleaned) return "";
+  const parts = cleaned.split(/\s+/).filter(Boolean);
+  if (parts.length === 1) return parts[0];
+  const surname = parts.at(-1);
+  const given = parts.slice(0, -1);
+  const initials = given
+    .map((part) => part.replace(/[^A-Za-z-]/g, ""))
+    .filter(Boolean)
+    .map((part) => {
+      if (part.includes("-")) {
+        return part
+          .split("-")
+          .filter(Boolean)
+          .map((seg) => `${seg[0].toUpperCase()}.`)
+          .join("-");
+      }
+      return `${part[0].toUpperCase()}.`;
+    })
+    .join(" ");
+  return initials ? `${surname}, ${initials}` : surname;
+}
+
+function formatApaAuthors(authors) {
+  const deduped = [];
+  const seen = new Set();
+  for (const name of authors || []) {
+    const formatted = formatApaAuthor(name);
+    if (!formatted) continue;
+    const key = formatted.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(formatted);
+  }
+  if (!deduped.length) return "";
+  if (deduped.length === 1) return deduped[0];
+  if (deduped.length === 2) return `${deduped[0]}, & ${deduped[1]}`;
+  return `${deduped.slice(0, -1).join(", ")}, & ${deduped.at(-1)}`;
+}
+
+function buildApaCitation(record) {
+  const authors = formatApaAuthors(record.authors || []);
+  const year = cleanText(record.year);
+  const title = cleanText(record.title);
+  const journal = cleanText(record.journal);
+  const volume = cleanText(record.volume);
+  const issue = cleanText(record.issue);
+  const pageRange = cleanText(record.pageRange);
+  const doiUrl = cleanText(record.doiUrl);
+
+  if ([authors, year, title, journal, doiUrl].some((field) => isNotVerifiedValue(field))) {
+    return "[Not verified]";
+  }
+
+  const hasVolume = !isNotVerifiedValue(volume);
+  const hasIssue = !isNotVerifiedValue(issue);
+  const hasPageRange = !isNotVerifiedValue(pageRange);
+  const hasPublishedOnline = !isNotVerifiedValue(record.publishedOnline);
+  const volumeIssue = hasVolume ? (hasIssue ? `${volume}(${issue})` : volume) : "";
+  const publicationTailParts = [];
+  if (volumeIssue) publicationTailParts.push(volumeIssue);
+  if (hasPageRange) publicationTailParts.push(pageRange);
+  if (!volumeIssue && !hasPageRange && hasPublishedOnline) {
+    publicationTailParts.push("Advance online publication");
+  }
+  const publicationTail = publicationTailParts.join(", ");
+  if (!publicationTail) {
+    return "[Not verified]";
+  }
+  if (publicationTail) {
+    return `${authors} (${year}). ${title}. ${journal}, ${publicationTail}. ${doiUrl}`;
+  }
+  return `${authors} (${year}). ${title}. ${journal}. ${doiUrl}`;
+}
+
+function ensureField(value) {
+  const cleaned = cleanText(value);
+  return cleaned || "[Not verified]";
+}
+
+function requiredMissing(record) {
+  const required = ["title", "doiUrl", "journal", "year", "abstract", "citation"];
+  return required.filter((key) => isNotVerifiedValue(record[key]));
+}
+
+function normalizeArticleTypeValue(value) {
+  const text = cleanText(value).toLowerCase();
+  if (!text) return "";
+
+  if (/\beditorial\s*(board|data)\b/i.test(text)) return "announcement";
+  if (/(book\s*review|media\s*review)/i.test(text)) return "book-review";
+  if (/\b(editorial|from the editors?)\b/i.test(text)) return "editorial";
+  if (/\bdiscussion\b/i.test(text)) return "discussion";
+  if (/\b(commentary|perspective|opinion)\b/i.test(text)) return "commentary";
+  if (/\b(corrigendum|corrigenda)\b/i.test(text)) return "corrigendum";
+  if (/\b(erratum|errata)\b/i.test(text)) return "erratum";
+  if (/\b(retraction|withdrawal)\b/i.test(text)) return "retraction";
+  if (/\binterview\b/i.test(text)) return "interview";
+  if (/\bcall\s*for\s*papers?\b/i.test(text)) return "call-for-papers";
+  if (/\b(announcement|announcements)\b/i.test(text)) return "announcement";
+  if (/\bnews\b/i.test(text)) return "news";
+  if (/\b(research\s*paper|research\s*article|original\s*article)\b/i.test(text)) {
+    return "research-article";
+  }
+  if (/\b(scholarlyarticle|journalarticle)\b/i.test(text)) return "research-article";
+  if (/\barticle\b/i.test(text)) return "research-article";
+  return "";
+}
+
+function classifyArticleType({ typeHints, title, pageTitle }) {
+  const hintValues = uniqueStrings(typeHints || []);
+  const fallbackValues = uniqueStrings([title, pageTitle]);
+  for (const source of [...hintValues, ...fallbackValues]) {
+    const normalized = normalizeArticleTypeValue(source);
+    if (!normalized) continue;
+    if (EXCLUDE_ARTICLE_TYPES.has(normalized)) {
+      return {
+        articleType: normalized,
+        ingestDecision: "exclude",
+        ingestReason: `excluded_by_type:${normalized}`,
+      };
+    }
+    if (INCLUDE_ARTICLE_TYPES.has(normalized)) {
+      return {
+        articleType: normalized,
+        ingestDecision: "include",
+        ingestReason: `included_by_type:${normalized}`,
+      };
+    }
+  }
+  return {
+    articleType: "[Not verified]",
+    ingestDecision: "not_verified",
+    ingestReason: "article_type_unclear",
+  };
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function uniqueStrings(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of values) {
+    const cleaned = cleanText(value);
+    if (!cleaned) continue;
+    if (seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    out.push(cleaned);
+  }
+  return out;
+}
+
+function isScienceDirectLikeUrl(rawUrl) {
+  const host = hostForUrl(rawUrl);
+  if (/(^|\.)sciencedirect\.com$/i.test(host)) return true;
+  return /10\.1016\//i.test(String(rawUrl || ""));
+}
+
+function scienceDirectPiiFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const fromPath = parsed.pathname.match(/\/science\/article\/pii\/([A-Za-z0-9]+)/i);
+    if (fromPath?.[1]) {
+      return fromPath[1];
+    }
+    const fromQuery = parsed.searchParams.get("_piikey") || parsed.searchParams.get("pii");
+    if (fromQuery) {
+      return fromQuery.replace(/[^A-Za-z0-9]/g, "");
+    }
+  } catch {
+    // ignore invalid URL
+  }
+  return "";
+}
+
+function canonicalScienceDirectArticleUrl(rawUrl) {
+  const pii = scienceDirectPiiFromUrl(rawUrl);
+  if (!pii) return rawUrl;
+  return `https://www.sciencedirect.com/science/article/pii/${pii}`;
+}
+
+function decodeHtmlEntities(value) {
+  const input = String(value || "");
+  return input
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&#(\d+);/g, (_, num) => {
+      const code = Number.parseInt(num, 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+    });
+}
+
+function stripHtmlTags(value) {
+  return String(value || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ");
+}
+
+function parseHtmlAttribute(tag, attrName) {
+  const pattern = new RegExp(
+    `${attrName}\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s\"'>]+))`,
+    "i"
+  );
+  const match = tag.match(pattern);
+  if (!match) return "";
+  return match[1] ?? match[2] ?? match[3] ?? "";
+}
+
+function extractMetaMapFromHtml(html) {
+  const map = new Map();
+  const metaTagRegex = /<meta\b[^>]*>/gi;
+  let match;
+  while ((match = metaTagRegex.exec(html)) !== null) {
+    const tag = match[0];
+    const key = cleanText(
+      decodeHtmlEntities(parseHtmlAttribute(tag, "name") || parseHtmlAttribute(tag, "property"))
+    ).toLowerCase();
+    const content = cleanText(decodeHtmlEntities(parseHtmlAttribute(tag, "content")));
+    if (!key || !content) continue;
+    if (!map.has(key)) {
+      map.set(key, []);
+    }
+    map.get(key).push(content);
+  }
+  return map;
+}
+
+function pickMetaValues(metaMap, names) {
+  const out = [];
+  for (const name of names) {
+    const values = metaMap.get(String(name).toLowerCase());
+    if (values?.length) {
+      out.push(...values);
+    }
+  }
+  return uniqueStrings(out);
+}
+
+function pickMetaFirst(metaMap, names) {
+  const values = pickMetaValues(metaMap, names);
+  return values[0] || "";
+}
+
+function extractTagText(html, tagName) {
+  const regex = new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i");
+  const match = html.match(regex);
+  if (!match?.[1]) return "";
+  return cleanText(decodeHtmlEntities(stripHtmlTags(match[1])));
+}
+
+function extractJsonObjectAfterMarker(source, marker) {
+  const markerIndex = source.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const start = source.indexOf("{", markerIndex + marker.length);
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === quote) {
+        inString = false;
+        quote = "";
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function extractJsonLdNodes(html) {
+  const nodes = [];
+  const regex = /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    const raw = cleanText(match[1]);
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        nodes.push(...parsed);
+      } else {
+        nodes.push(parsed);
+      }
+    } catch {
+      // Ignore malformed JSON-LD blocks.
+    }
+  }
+  return nodes.filter((node) => node && typeof node === "object");
+}
+
+function collectStringCandidatesByKey(node, keyRegex, output, seen = new Set(), depth = 0) {
+  if (!node || depth > 20) return;
+  if (typeof node !== "object") return;
+  if (seen.has(node)) return;
+  seen.add(node);
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectStringCandidatesByKey(item, keyRegex, output, seen, depth + 1);
+    }
+    return;
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    if (typeof value === "string" && keyRegex.test(key)) {
+      const cleaned = cleanText(decodeHtmlEntities(stripHtmlTags(value)));
+      if (cleaned) {
+        output.push(cleaned);
+      }
+    }
+    if (value && typeof value === "object") {
+      collectStringCandidatesByKey(value, keyRegex, output, seen, depth + 1);
+    }
+  }
+}
+
+function walkJsonNode(node, visit, seen = new Set(), depth = 0) {
+  if (node === null || node === undefined || depth > 30) return;
+  if (typeof node !== "object") return;
+  if (seen.has(node)) return;
+  seen.add(node);
+
+  visit(node);
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      walkJsonNode(item, visit, seen, depth + 1);
+    }
+    return;
+  }
+  for (const value of Object.values(node)) {
+    walkJsonNode(value, visit, seen, depth + 1);
+  }
+}
+
+function collectUnderscoreTextValues(node) {
+  const values = [];
+  walkJsonNode(node, (entry) => {
+    if (entry && typeof entry === "object" && typeof entry._ === "string") {
+      const cleaned = cleanText(decodeHtmlEntities(stripHtmlTags(entry._)));
+      if (cleaned) {
+        values.push(cleaned);
+      }
+    }
+  });
+  return uniqueStrings(values);
+}
+
+function extractScienceDirectAuthorsFromPreloadedState(state) {
+  const names = [];
+  const authorRoots = [];
+  if (state?.authors?.content) {
+    authorRoots.push(state.authors.content);
+  }
+  if (state?.article?.["last-author"]) {
+    authorRoots.push(state.article["last-author"]);
+  }
+
+  for (const root of authorRoots) {
+    walkJsonNode(root, (entry) => {
+      if (entry?.["#name"] !== "author" || !Array.isArray(entry?.$$)) return;
+      let given = "";
+      let surname = "";
+      for (const child of entry.$$) {
+        if (child?.["#name"] === "given-name") {
+          given = cleanText(child._);
+        }
+        if (child?.["#name"] === "surname") {
+          surname = cleanText(child._);
+        }
+      }
+      const combined = cleanText([given, surname].filter(Boolean).join(" "));
+      if (combined) {
+        names.push(combined);
+      }
+    });
+  }
+
+  return uniqueStrings(names);
+}
+
+function normalizeAbstractText(value) {
+  const cleaned = cleanText(decodeHtmlEntities(stripHtmlTags(value)));
+  if (!cleaned) return "";
+  return cleaned.replace(/^abstract[:\s-]*/i, "").trim();
+}
+
+function chooseBestAbstract(candidates) {
+  const normalized = uniqueStrings(candidates.map((item) => normalizeAbstractText(item)));
+  const filtered = normalized.filter((text) => text.length >= 80);
+  if (!filtered.length) return normalized[0] || "";
+  const scored = filtered
+    .filter((text) => !/(all rights reserved|cookie|javascript|privacy policy)/i.test(text))
+    .sort((a, b) => b.length - a.length);
+  return scored[0] || filtered[0] || "";
+}
+
+function detectChallengeInHtml(html, url = "") {
+  const title = extractTagText(html, "title");
+  const body = cleanText(stripHtmlTags(html)).slice(0, 4000);
+  const haystack = `${title}\n${body}\n${url}`.toLowerCase();
+  const hits = CHALLENGE_TERMS.filter((term) => haystack.includes(term));
+  return {
+    isChallenge: hits.length > 0,
+    signals: hits,
+    title,
+    url,
+  };
+}
+
+async function fetchHtmlWithCurl(url, args) {
+  const maxTimeSeconds = Math.max(5, Math.ceil(args.timeoutMs / 1000));
+  const writeOutMarker = "\n__CODEX_EFFECTIVE_URL__:%{url_effective}\n__CODEX_HTTP_CODE__:%{http_code}\n";
+  const curlArgs = [
+    "-L",
+    "--compressed",
+    "--silent",
+    "--show-error",
+    "--max-time",
+    String(maxTimeSeconds),
+    "-A",
+    CURL_USER_AGENT,
+    "--write-out",
+    writeOutMarker,
+    url,
+  ];
+
+  return await new Promise((resolve, reject) => {
+    execFile(
+      "curl",
+      curlArgs,
+      { maxBuffer: CURL_MAX_BUFFER_BYTES },
+      (error, stdout = "", stderr = "") => {
+        if (error) {
+          reject(new Error(`curl failed: ${error.message}${stderr ? ` | ${stderr}` : ""}`));
+          return;
+        }
+        const payload = String(stdout);
+        const markerMatch = payload.match(
+          /__CODEX_EFFECTIVE_URL__:(.*)\n__CODEX_HTTP_CODE__:(\d{3})\s*$/s
+        );
+        if (!markerMatch) {
+          resolve({
+            html: payload,
+            effectiveUrl: url,
+            statusCode: null,
+            stderr: String(stderr || ""),
+          });
+          return;
+        }
+        const markerText = markerMatch[0];
+        const html = payload.slice(0, payload.length - markerText.length);
+        resolve({
+          html,
+          effectiveUrl: cleanText(markerMatch[1]) || url,
+          statusCode: Number.parseInt(markerMatch[2], 10),
+          stderr: String(stderr || ""),
+        });
+      }
+    );
+  });
+}
+
+function extractMetadataFromScienceDirectHtml(html, sourceUrl, finalUrl) {
+  const metaMap = extractMetaMapFromHtml(html);
+  const jsonLdNodes = extractJsonLdNodes(html);
+  const pageTitle = extractTagText(html, "title");
+
+  const jsonLdPrimary = jsonLdNodes.find((node) => node?.["@type"]) || jsonLdNodes[0] || {};
+  const jsonLdAuthorNames = (() => {
+    const authorNode = jsonLdPrimary?.author;
+    if (!authorNode) return [];
+    const list = Array.isArray(authorNode) ? authorNode : [authorNode];
+    return uniqueStrings(
+      list.map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") {
+          return item.name || "";
+        }
+        return "";
+      })
+    );
+  })();
+
+  const preloadedState = (() => {
+    const rawJson = extractJsonObjectAfterMarker(html, "window.__PRELOADED_STATE__");
+    if (!rawJson) return null;
+    try {
+      return JSON.parse(rawJson);
+    } catch {
+      return null;
+    }
+  })();
+  const preloadedArticle = preloadedState?.article && typeof preloadedState.article === "object"
+    ? preloadedState.article
+    : {};
+  const preloadedTitle = cleanText(
+    preloadedArticle?.title?.content?.find?.((item) => item?.["#name"] === "title")?._ ||
+      preloadedArticle?.titleString ||
+      ""
+  );
+  const preloadedAuthors = extractScienceDirectAuthorsFromPreloadedState(preloadedState);
+  const preloadedAbstractTexts = collectUnderscoreTextValues(preloadedState?.abstracts?.content || []);
+  const preloadedJournal = cleanText(preloadedArticle?.srctitle || "");
+  const preloadedVolume = cleanText(preloadedArticle?.["vol-first"] || "");
+  const preloadedIssue = cleanText(preloadedArticle?.["iss-first"] || "");
+  const preloadedPage = cleanText(
+    preloadedArticle?.["first-fp"] ||
+      preloadedArticle?.["article-number"] ||
+      preloadedArticle?.pages?.[0]?.["first-page"] ||
+      ""
+  );
+  const preloadedDate = cleanText(
+    preloadedArticle?.["cover-date-start"] ||
+      preloadedState?.dates?.["Publication date"] ||
+      preloadedState?.dates?.["Available online"] ||
+      ""
+  );
+  const preloadedDoi = cleanText(preloadedArticle?.doi || "");
+  const preloadedType = cleanText(
+    preloadedState?.documentTypeLabel || preloadedArticle?.["documentTypeLabel"] || ""
+  );
+
+  const abstractCandidates = [];
+  abstractCandidates.push(
+    ...pickMetaValues(metaMap, [
+      "citation_abstract",
+      "dc.description",
+      "description",
+      "og:description",
+    ])
+  );
+  if (jsonLdPrimary?.abstract) {
+    abstractCandidates.push(jsonLdPrimary.abstract);
+  }
+  if (preloadedState) {
+    collectStringCandidatesByKey(preloadedState, /abstract/i, abstractCandidates);
+    abstractCandidates.push(...preloadedAbstractTexts);
+  }
+
+  const title =
+    pickMetaFirst(metaMap, ["citation_title", "dc.title", "og:title", "twitter:title"]) ||
+    preloadedTitle ||
+    cleanText(jsonLdPrimary?.headline || jsonLdPrimary?.name) ||
+    pageTitle;
+  const authorsFromMeta = pickMetaValues(metaMap, ["citation_author", "dc.creator"]);
+  const authors =
+    authorsFromMeta.length > 0
+      ? authorsFromMeta
+      : preloadedAuthors.length > 0
+        ? preloadedAuthors
+        : jsonLdAuthorNames;
+  const journal =
+    pickMetaFirst(metaMap, ["citation_journal_title", "prism.publicationname", "dc.source"]) ||
+    preloadedJournal ||
+    cleanText(jsonLdPrimary?.isPartOf?.name || "");
+  const publicationDate =
+    pickMetaFirst(metaMap, [
+      "citation_publication_date",
+      "citation_online_date",
+      "citation_date",
+      "dc.date",
+      "prism.publicationdate",
+      "article:published_time",
+    ]) ||
+    preloadedDate ||
+    cleanText(jsonLdPrimary?.datePublished || jsonLdPrimary?.dateCreated || "");
+  const volume = pickMetaFirst(metaMap, ["citation_volume", "prism.volume"]) || preloadedVolume;
+  const issue = pickMetaFirst(metaMap, ["citation_issue", "prism.number"]) || preloadedIssue;
+  const firstPage = pickMetaFirst(metaMap, ["citation_firstpage", "prism.startingpage"]);
+  const lastPage = pickMetaFirst(metaMap, ["citation_lastpage", "prism.endingpage"]);
+  const pageRange = firstPage && lastPage ? `${firstPage}-${lastPage}` : firstPage || preloadedPage;
+  const doiMeta =
+    pickMetaFirst(metaMap, ["citation_doi", "prism.doi", "dc.identifier"]) ||
+    preloadedDoi ||
+    cleanText(jsonLdPrimary?.identifier || "");
+  const articleTypeHint =
+    pickMetaFirst(metaMap, [
+      "citation_article_type",
+      "dc.type",
+      "prism.section",
+      "prism.contenttype",
+      "article:section",
+      "og:type",
+    ]) ||
+    preloadedType ||
+    cleanText(jsonLdPrimary?.["@type"] || "");
+  const ogUrl = pickMetaFirst(metaMap, ["og:url"]);
+  const abstractText = chooseBestAbstract(abstractCandidates);
+
+  return {
+    sourceUrl,
+    finalUrl: ogUrl || finalUrl || sourceUrl,
+    title,
+    authors,
+    journal,
+    publicationDate,
+    volume,
+    issue,
+    firstPage,
+    lastPage,
+    pageRange,
+    doiMeta,
+    abstractText,
+    articleTypeHint,
+    pageTitle,
+  };
+}
+
+async function readInputUrls(inputPath) {
+  const raw = await fs.readFile(inputPath, "utf-8");
+  const parsed = JSON.parse(raw);
+
+  const urls = [];
+  const pushUrl = (value) => {
+    const url = cleanText(value);
+    if (!url) return;
+    urls.push(url);
+  };
+
+  const ingest = (node) => {
+    if (!node) return;
+    if (typeof node === "string") {
+      pushUrl(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) ingest(item);
+      return;
+    }
+    if (typeof node === "object") {
+      pushUrl(node.url);
+      pushUrl(node.sourceUrl);
+      pushUrl(node.doiUrl);
+      if (Array.isArray(node.urls)) {
+        for (const u of node.urls) pushUrl(u);
+      }
+      if (Array.isArray(node.records)) ingest(node.records);
+      if (Array.isArray(node.results)) ingest(node.results);
+    }
+  };
+
+  ingest(parsed);
+  return uniqueStrings(urls);
+}
+
+async function detectChallenge(page) {
+  const probe = await page.evaluate(() => {
+    const title = document.title || "";
+    const body = (document.body?.innerText || "").slice(0, 4000);
+    const url = window.location.href || "";
+    return { title, body, url };
+  });
+  const haystack = `${probe.title}\n${probe.body}\n${probe.url}`.toLowerCase();
+  const hits = CHALLENGE_TERMS.filter((term) => haystack.includes(term));
+  return {
+    isChallenge: hits.length > 0,
+    signals: hits,
+    title: probe.title,
+    url: probe.url,
+  };
+}
+
+async function waitForChallengeClear(page, args, verbose) {
+  const started = Date.now();
+  let probe = await detectChallenge(page);
+  while (probe.isChallenge && Date.now() - started < args.challengeWaitMs) {
+    await page.waitForTimeout(args.challengePollMs);
+    probe = await detectChallenge(page);
+    log(
+      `Challenge still present (${Math.round((Date.now() - started) / 1000)}s): ${probe.signals.join(", ")}`,
+      verbose
+    );
+  }
+  return {
+    ...probe,
+    waitedMs: Date.now() - started,
+  };
+}
+
+function buildRecordFromExtracted(extracted, sourceUrl) {
+  const doiUrl =
+    normalizeDoi(extracted?.doiMeta) ||
+    normalizeDoi(extractDoiFromText(extracted?.finalUrl || "")) ||
+    normalizeDoi(extractDoiFromText(sourceUrl));
+  const year = parseYear(extracted?.publicationDate || "");
+  const normalized = {
+    sourceUrl: sourceUrl,
+    finalUrl: extracted?.finalUrl || sourceUrl,
+    title: ensureField(extracted?.title),
+    authors: uniqueStrings(extracted?.authors || []),
+    year: ensureField(year),
+    journal: ensureField(extracted?.journal),
+    volume: ensureField(extracted?.volume),
+    issue: ensureField(extracted?.issue),
+    pageRange: ensureField(extracted?.pageRange),
+    publishedOnline: ensureField(extracted?.publicationDate),
+    doiUrl: ensureField(doiUrl),
+    abstract: ensureField(extracted?.abstractText),
+    citation: "[Not verified]",
+    articleTypeRaw: ensureField(extracted?.articleTypeHint),
+    articleType: "[Not verified]",
+    ingestDecision: "not_verified",
+    ingestReason: "article_type_unclear",
+  };
+  const classification = classifyArticleType({
+    typeHints: [extracted?.articleTypeHint, extracted?.pageTitle],
+    title: extracted?.title,
+    pageTitle: extracted?.pageTitle,
+  });
+  normalized.articleType = classification.articleType;
+  normalized.ingestDecision = classification.ingestDecision;
+  normalized.ingestReason = classification.ingestReason;
+  normalized.citation = buildApaCitation(normalized);
+  normalized.missingFields = requiredMissing(normalized);
+  normalized.status = normalized.missingFields.length ? "not_verified" : "verified";
+  return normalized;
+}
+
+async function extractMetadata(page, sourceUrl, policy) {
+  const selectors = policy.abstractSelectors || [];
+  const extracted = await page.evaluate((abstractSelectors) => {
+    const readMetaValues = (names) => {
+      const values = [];
+      for (const name of names) {
+        const selectors = [
+          `meta[name="${name}"]`,
+          `meta[property="${name}"]`,
+          `meta[name="${name.toLowerCase()}"]`,
+          `meta[property="${name.toLowerCase()}"]`,
+        ];
+        for (const sel of selectors) {
+          const nodes = document.querySelectorAll(sel);
+          for (const node of nodes) {
+            const value = (node.getAttribute("content") || "").trim();
+            if (value) values.push(value);
+          }
+        }
+      }
+      return values;
+    };
+
+    const pickText = (selectorList) => {
+      for (const selector of selectorList) {
+        const node = document.querySelector(selector);
+        const text = (node?.textContent || "").replace(/\s+/g, " ").trim();
+        if (text) return text;
+      }
+      return "";
+    };
+
+    const title = (() => {
+      const metaTitle = readMetaValues([
+        "citation_title",
+        "dc.title",
+        "og:title",
+        "twitter:title",
+      ])[0];
+      if (metaTitle) return metaTitle;
+      return (
+        pickText(["h1.citation__title", "h1.article-title", "h1"]) ||
+        (document.title || "").replace(/\s+/g, " ").trim()
+      );
+    })();
+
+    const authors = (() => {
+      const byMeta = readMetaValues(["citation_author", "dc.creator"]);
+      if (byMeta.length) return byMeta;
+      const byDom = Array.from(
+        document.querySelectorAll(
+          'a[rel="author"], .author-name, .loa__author-name, .article-header__authors li'
+        )
+      )
+        .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+      return byDom;
+    })();
+
+    const journal = (() => {
+      const fromMeta = readMetaValues([
+        "citation_journal_title",
+        "prism.publicationName",
+        "dc.source",
+      ])[0];
+      if (fromMeta) return fromMeta;
+      return pickText([
+        ".publication-title",
+        ".journal-title",
+        '[data-test="journal-title"]',
+      ]);
+    })();
+
+    let pubDate = readMetaValues([
+      "citation_publication_date",
+      "citation_online_date",
+      "citation_date",
+      "dc.date",
+      "prism.publicationDate",
+      "article:published_time",
+    ])[0];
+    let jsonLdType = "";
+    const jsonLdNodes = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+    for (const node of jsonLdNodes) {
+      const raw = (node.textContent || "").trim();
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        const candidates = Array.isArray(parsed) ? parsed : [parsed];
+        for (const candidate of candidates) {
+          if (!candidate || typeof candidate !== "object") continue;
+          const typeValue = String(candidate["@type"] || "").trim();
+          if (!jsonLdType && typeValue) {
+            jsonLdType = typeValue;
+          }
+          if (!pubDate) {
+            const dateValue =
+              candidate.datePublished || candidate.dateCreated || candidate.dateModified || "";
+            const dateText = String(dateValue || "").trim();
+            if (dateText) {
+              pubDate = dateText;
+            }
+          }
+        }
+      } catch {
+        // ignore malformed JSON-LD blocks
+      }
+      if (pubDate && jsonLdType) break;
+    }
+
+    const volume = readMetaValues(["citation_volume", "prism.volume"])[0] || "";
+    const issue = readMetaValues(["citation_issue", "prism.number"])[0] || "";
+    const firstPage = readMetaValues(["citation_firstpage", "prism.startingPage"])[0] || "";
+    const lastPage = readMetaValues(["citation_lastpage", "prism.endingPage"])[0] || "";
+    const doiMeta =
+      readMetaValues(["citation_doi", "dc.identifier", "prism.doi"])[0] || "";
+
+    const abstractFromMeta = readMetaValues([
+      "citation_abstract",
+      "dc.description",
+      "description",
+      "og:description",
+    ])[0];
+
+    const articleTypeFromMeta = readMetaValues([
+      "citation_article_type",
+      "dc.type",
+      "prism.section",
+      "prism.contentType",
+      "article:section",
+      "og:type",
+    ])[0];
+    const articleTypeFromDom = pickText([
+      ".article-header__article-type",
+      ".article-header__category",
+      ".issue-item__article-type",
+      ".article__category",
+      ".toc__section",
+    ]);
+
+    let abstractText = abstractFromMeta || "";
+    if (!abstractText) {
+      abstractText = pickText(abstractSelectors);
+    }
+
+    const pageRange = (() => {
+      if (firstPage && lastPage) return `${firstPage}-${lastPage}`;
+      if (firstPage) return firstPage;
+      return "";
+    })();
+
+    return {
+      title,
+      authors,
+      journal,
+      publicationDate: pubDate || "",
+      volume,
+      issue,
+      firstPage,
+      lastPage,
+      pageRange,
+      doiMeta,
+      abstractText,
+      articleTypeHint: articleTypeFromMeta || articleTypeFromDom || jsonLdType || "",
+      finalUrl: window.location.href,
+      pageTitle: document.title || "",
+    };
+  }, selectors);
+  return buildRecordFromExtracted(extracted, sourceUrl);
+}
+
+function challengeError(message, details) {
+  const error = new Error(message);
+  error.name = "ChallengeError";
+  error.details = details;
+  return error;
+}
+
+function buildVerificationFailureRecord(inputUrl, policy, errors) {
+  return {
+    sourceUrl: inputUrl,
+    finalUrl: inputUrl,
+    title: "[Not verified]",
+    authors: [],
+    year: "[Not verified]",
+    journal: "[Not verified]",
+    volume: "[Not verified]",
+    issue: "[Not verified]",
+    pageRange: "[Not verified]",
+    publishedOnline: "[Not verified]",
+    doiUrl: ensureField(normalizeDoi(inputUrl)),
+    abstract: "[Not verified]",
+    citation: "[Not verified]",
+    missingFields: ["title", "journal", "year", "abstract", "citation"],
+    status: "not_verified",
+    articleTypeRaw: "[Not verified]",
+    articleType: "[Not verified]",
+    ingestDecision: "not_verified",
+    ingestReason: "verification_failed",
+    policy: {
+      name: policy?.name || "default",
+      protected: Boolean(policy?.protected),
+    },
+    verifiedAt: new Date().toISOString(),
+    errors,
+  };
+}
+
+async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolvedTracking, args) {
+  const fetchTargets = uniqueStrings([
+    canonicalScienceDirectArticleUrl(targetUrl),
+    targetUrl,
+    canonicalScienceDirectArticleUrl(sourceUrl),
+    sourceUrl,
+  ]);
+  const errors = [];
+
+  for (const fetchTarget of fetchTargets) {
+    try {
+      log(`ScienceDirect curl fetch: ${fetchTarget}`, args.verbose);
+      const fetched = await fetchHtmlWithCurl(fetchTarget, args);
+      const challenge = detectChallengeInHtml(fetched.html, fetched.effectiveUrl || fetchTarget);
+      if (challenge.isChallenge) {
+        throw challengeError("ScienceDirect challenge page detected (curl path)", challenge);
+      }
+      const extracted = extractMetadataFromScienceDirectHtml(
+        fetched.html,
+        sourceUrl,
+        fetched.effectiveUrl || fetchTarget
+      );
+      const record = buildRecordFromExtracted(extracted, sourceUrl);
+      record.policy = {
+        name: policy.name,
+        protected: Boolean(policy.protected),
+      };
+      record.resolvedUrl = fetched.effectiveUrl || fetchTarget;
+      record.tracking = {
+        usedResolution: resolvedTracking.usedTrackingResolution,
+        sourceUrl: resolvedTracking.inputUrl,
+        resolvedUrl: resolvedTracking.resolvedUrl,
+        statusCode: resolvedTracking.trackingStatus || null,
+        error: resolvedTracking.trackingResolutionError || "",
+      };
+      record.retrieval = {
+        mode: "curl_sciencedirect",
+        fetchedUrl: fetchTarget,
+        statusCode: Number.isFinite(fetched.statusCode) ? fetched.statusCode : null,
+      };
+      record.verifiedAt = new Date().toISOString();
+      return { ok: true, record, errors };
+    } catch (error) {
+      errors.push({
+        method: "curl_sciencedirect",
+        targetUrl: fetchTarget,
+        errorName: String(error?.name || "Error"),
+        message: String(error?.message || error),
+        challengeSignals: error?.details?.signals || [],
+      });
+    }
+  }
+
+  return { ok: false, errors };
+}
+
+async function verifySingleUrl(getContext, inputUrl, args) {
+  const canonical = normalizeDoi(inputUrl);
+  const targets = uniqueStrings([inputUrl, canonical]);
+  const backoffMs = [2000, 5000, 10000];
+  const errors = [];
+  let lastPolicy = policyForUrl(inputUrl);
+
+  for (let attempt = 1; attempt <= args.maxRetries; attempt += 1) {
+    for (const rawTargetUrl of targets) {
+      const resolved = await resolveTrackedUrl(rawTargetUrl, args);
+      const targetUrl = resolved.resolvedUrl;
+      const policy = policyForUrl(targetUrl);
+      lastPolicy = policy;
+
+      const shouldTryScienceDirectCurl =
+        args.sciencedirectMode !== "browser" &&
+        (policy.name === "sciencedirect" ||
+          isScienceDirectLikeUrl(targetUrl) ||
+          isScienceDirectLikeUrl(rawTargetUrl) ||
+          isScienceDirectLikeUrl(inputUrl));
+
+      if (shouldTryScienceDirectCurl) {
+        const curlResult = await verifyScienceDirectViaCurl(
+          inputUrl,
+          targetUrl,
+          policy,
+          resolved,
+          args
+        );
+        if (curlResult.ok) {
+          if (
+            curlResult.record.status === "verified" ||
+            args.sciencedirectMode === "curl" ||
+            curlResult.record.ingestDecision === "exclude"
+          ) {
+            return { ok: true, record: curlResult.record };
+          }
+          errors.push({
+            method: "curl_sciencedirect",
+            attempt,
+            rawTargetUrl,
+            targetUrl,
+            errorName: "IncompleteRecord",
+            message:
+              "ScienceDirect curl path returned partial metadata; falling back to browser extraction.",
+            missingFields: curlResult.record.missingFields || [],
+            trackingResolutionError: resolved.trackingResolutionError || "",
+          });
+        } else {
+          for (const err of curlResult.errors) {
+            errors.push({
+              method: "curl_sciencedirect",
+              attempt,
+              rawTargetUrl,
+              targetUrl,
+              errorName: err.errorName || "Error",
+              message: err.message || "ScienceDirect curl extraction failed",
+              challengeSignals: err.challengeSignals || [],
+              trackingResolutionError: resolved.trackingResolutionError || "",
+            });
+          }
+        }
+
+        if (args.sciencedirectMode === "curl") {
+          continue;
+        }
+      }
+
+      const context = await getContext();
+      const page = await context.newPage();
+      page.setDefaultTimeout(args.timeoutMs);
+      try {
+        log(
+          `Attempt ${attempt}/${args.maxRetries} | policy=${policy.name} | target=${targetUrl}`,
+          args.verbose
+        );
+        if (resolved.usedTrackingResolution) {
+          log(
+            `Tracking resolution: ${resolved.inputUrl} -> ${resolved.resolvedUrl}` +
+              (resolved.trackingStatus ? ` (status ${resolved.trackingStatus})` : ""),
+            args.verbose
+          );
+        }
+        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: args.timeoutMs });
+        try {
+          await page.waitForLoadState("networkidle", { timeout: 5000 });
+        } catch {
+          // Network idle can hang on analytics-heavy pages; continue.
+        }
+        const challenge = await waitForChallengeClear(page, args, args.verbose);
+        if (challenge.isChallenge) {
+          throw challengeError("Challenge page detected", challenge);
+        }
+        const record = await extractMetadata(page, inputUrl, policy);
+        record.policy = {
+          name: policy.name,
+          protected: Boolean(policy.protected),
+        };
+        record.resolvedUrl = targetUrl;
+        record.tracking = {
+          usedResolution: resolved.usedTrackingResolution,
+          sourceUrl: resolved.inputUrl,
+          resolvedUrl: resolved.resolvedUrl,
+          statusCode: resolved.trackingStatus || null,
+          error: resolved.trackingResolutionError || "",
+        };
+        record.verifiedAt = new Date().toISOString();
+        await page.close();
+        return { ok: true, record };
+      } catch (error) {
+        const errText = String(error?.message || error);
+        const errName = String(error?.name || "Error");
+        const challengeSignals = error?.details?.signals || [];
+        errors.push({
+          attempt,
+          rawTargetUrl,
+          targetUrl,
+          errorName: errName,
+          message: errText,
+          challengeSignals,
+          trackingResolutionError: resolved.trackingResolutionError || "",
+        });
+        await page.close();
+      }
+    }
+    const sleepMs = backoffMs[Math.min(attempt - 1, backoffMs.length - 1)];
+    await sleep(sleepMs);
+  }
+
+  return {
+    ok: false,
+    record: buildVerificationFailureRecord(inputUrl, lastPolicy, errors),
+  };
+}
+
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  async function runWorker() {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(limit, items.length) }, () => runWorker());
+  await Promise.all(runners);
+  return results;
+}
+
+async function initBrowser(args) {
+  let playwright;
+  try {
+    playwright = await import("playwright");
+  } catch {
+    try {
+      playwright = await import("playwright-core");
+    } catch {
+      throw new Error(
+        "Missing dependency: playwright (or playwright-core) for Node. " +
+          "Install with `npm i playwright`."
+      );
+    }
+  }
+  const { chromium } = playwright;
+  if (args.cdpUrl) {
+    const browser = await chromium.connectOverCDP(args.cdpUrl);
+    const context = await browser.newContext();
+    return {
+      browser,
+      context,
+      mode: "cdp",
+      close: async () => {
+        await context.close();
+        await browser.close();
+      },
+    };
+  }
+  const browser = await chromium.launch({
+    headless: args.headless,
+    channel: args.channel || "chrome",
+  });
+  const context = await browser.newContext();
+  return {
+    browser,
+    context,
+    mode: "launch",
+    close: async () => {
+      await context.close();
+      await browser.close();
+    },
+  };
+}
+
+async function main() {
+  let args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+  } catch (error) {
+    usage();
+    process.stderr.write(`\nError: ${error.message}\n`);
+    process.exit(1);
+  }
+
+  const directUrls = uniqueStrings(args.urls);
+  const fileUrls = args.input ? await readInputUrls(args.input) : [];
+  const urls = uniqueStrings([...directUrls, ...fileUrls]);
+  if (!urls.length) {
+    throw new Error("No URLs found after parsing inputs.");
+  }
+
+  log(`Loaded ${urls.length} URL(s).`, args.verbose);
+
+  let browserState = null;
+  let browserInitPromise = null;
+  const getContext = async () => {
+    if (browserState) return browserState.context;
+    if (!browserInitPromise) {
+      browserInitPromise = initBrowser(args).then((state) => {
+        browserState = state;
+        return state;
+      });
+    }
+    const initialized = await browserInitPromise;
+    return initialized.context;
+  };
+
+  let results = [];
+  try {
+    results = await mapLimit(urls, args.concurrency, async (url) => {
+      return verifySingleUrl(getContext, url, args);
+    });
+  } finally {
+    if (browserState) {
+      await browserState.close();
+    }
+  }
+
+  const records = results.map((item) => item.record);
+  const output = {
+    generatedAt: new Date().toISOString(),
+    mode: browserState?.mode || "curl_only",
+    inputCount: urls.length,
+    verifiedCount: records.filter((r) => r.status === "verified").length,
+    notVerifiedCount: records.filter((r) => r.status !== "verified").length,
+    includableCount: records.filter((r) => r.ingestDecision === "include").length,
+    excludedCount: records.filter((r) => r.ingestDecision === "exclude").length,
+    records,
+  };
+
+  const serialized = `${JSON.stringify(output, null, 2)}\n`;
+  process.stdout.write(serialized);
+  if (args.output) {
+    await fs.mkdir(path.dirname(args.output), { recursive: true });
+    await fs.writeFile(args.output, serialized, "utf-8");
+  }
+}
+
+main().catch((error) => {
+  process.stderr.write(`Error: ${error.message || error}\n`);
+  process.exit(1);
+});
