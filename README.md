@@ -10,6 +10,13 @@
 - DOI normalization + duplicate-safe Notion payload planning.
 - Structured diagnostics for reproducible runs (`search_ladder`, `attempts`, warnings).
 
+## Recent Improvements (v0.1.2)
+
+- Fixed incomplete/truncated abstracts on Wiley article pages (including SMJ) by preferring full DOM abstract sections over teaser meta descriptions.
+- Verifier now re-evaluates publisher policy after browser navigation/redirects (for example DOI -> Wiley final URL), so publisher-specific selectors are applied on the actual page.
+- Added a Wiley/SMJ fixture regression test for abstract selection (`npm test`).
+- Validated live by re-verifying and backfilling 9 Strategic Management Journal (Vol. 47, No. 3) records with full abstracts in Notion.
+
 ## Recent Improvements (v0.1.1)
 
 - AOM/Atypon (`journals.aom.org`) extraction support with `dc.*` metadata parsing + DOM fallbacks.

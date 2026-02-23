@@ -1388,12 +1388,45 @@ async function extractMetadata(page, sourceUrl, policy) {
     const doiMeta =
       readMetaValues(["citation_doi", "dc.identifier", "prism.doi"])[0] || "";
 
-    const abstractFromMeta = readMetaValues([
+    const abstractMetaCandidates = readMetaValues([
       "citation_abstract",
       "dc.description",
       "description",
       "og:description",
-    ])[0];
+    ]);
+    const abstractFromDom = pickText(abstractSelectors);
+
+    const chooseBestAbstractLocal = (candidates) => {
+      const normalized = [];
+      const seen = new Set();
+      for (const raw of candidates) {
+        const cleaned = String(raw || "")
+          .replace(/\s+/g, " ")
+          .replace(/^abstract[:\s-]*/i, "")
+          .trim();
+        if (!cleaned) continue;
+        const key = cleaned.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        normalized.push(cleaned);
+      }
+      if (!normalized.length) return "";
+
+      const filtered = normalized.filter(
+        (text) => !/(all rights reserved|cookie|javascript|privacy policy)/i.test(text)
+      );
+      const pool = filtered.length ? filtered : normalized;
+      const scored = pool
+        .map((text) => {
+          let score = text.length;
+          if (/\.\.\.$/.test(text)) score -= 120; // common meta-description truncation
+          if (/^click on the article title to read more\.?$/i.test(text)) score -= 200;
+          if (/^click on the title to browse this issue\.?$/i.test(text)) score -= 200;
+          return { text, score };
+        })
+        .sort((a, b) => b.score - a.score || b.text.length - a.text.length);
+      return scored[0]?.text || "";
+    };
 
     const articleTypeFromMeta = readMetaValues([
       "citation_article_type",
@@ -1412,10 +1445,7 @@ async function extractMetadata(page, sourceUrl, policy) {
       ".article__tocHeading",
     ]);
 
-    let abstractText = abstractFromMeta || "";
-    if (!abstractText) {
-      abstractText = pickText(abstractSelectors);
-    }
+    const abstractText = chooseBestAbstractLocal([abstractFromDom, ...abstractMetaCandidates]);
 
     const pageRange = (() => {
       if (firstPage && lastPage) return `${firstPage}-${lastPage}`;
@@ -1675,12 +1705,29 @@ async function verifySingleUrl(getContext, inputUrl, args) {
         if (challenge.isChallenge) {
           throw challengeError("Challenge page detected", challenge);
         }
-        const record = await extractMetadata(page, inputUrl, policy);
+        const navigatedUrl = maybeCanonicalArticleUrl(page.url() || targetUrl);
+        const effectivePolicy = policyForUrl(navigatedUrl || targetUrl);
+        lastPolicy = effectivePolicy;
+
+        const nonArticleAfterNav = classifyKnownNonArticleLink(navigatedUrl);
+        if (nonArticleAfterNav) {
+          const record = buildExcludedLinkRecord(
+            inputUrl,
+            navigatedUrl || targetUrl,
+            effectivePolicy,
+            nonArticleAfterNav,
+            resolved
+          );
+          await page.close();
+          return { ok: true, record };
+        }
+
+        const record = await extractMetadata(page, inputUrl, effectivePolicy);
         record.policy = {
-          name: policy.name,
-          protected: Boolean(policy.protected),
+          name: effectivePolicy.name,
+          protected: Boolean(effectivePolicy.protected),
         };
-        record.resolvedUrl = targetUrl;
+        record.resolvedUrl = navigatedUrl || targetUrl;
         record.tracking = {
           usedResolution: resolved.usedTrackingResolution,
           sourceUrl: resolved.inputUrl,

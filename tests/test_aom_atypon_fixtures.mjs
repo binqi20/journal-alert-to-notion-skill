@@ -67,3 +67,17 @@ test("AOM AMD fixture strips honorifics in APA citation formatting", async () =>
   assert.doesNotMatch(record.citation, /\bDr\.\b|\bProfessor\b/);
   assert.match(record.citation, /^Hoffman, F\., Tumasjan, A\., Nyberg, A\. J\., & Welpe, I\. M\./);
 });
+
+test("Wiley SMJ fixture prefers full DOM abstract over truncated meta teaser", async () => {
+  const record = await runVerifierOnFixture("wiley_smj_abstract_prefers_dom_over_meta.html");
+  assert.equal(record.status, "verified");
+  assert.equal(record.ingestDecision, "include");
+  assert.equal(record.articleType, "research-article");
+  assert.equal(record.journal, "Strategic Management Journal");
+  assert.equal(record.doiUrl, "https://doi.org/10.1002/smj.79999");
+  assert.ok(record.abstract && record.abstract.length > 250, "expected full DOM abstract text");
+  assert.match(record.abstract, /full abstract text rendered in the Wiley article DOM/i);
+  assert.match(record.abstract, /Managerial Summary/i);
+  assert.doesNotMatch(record.abstract, /available\.\.\.$/i);
+  assert.doesNotMatch(record.abstract, /truncated Wiley-style teaser abstract/i);
+});

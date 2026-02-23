@@ -48,8 +48,10 @@ Use these scripts under `scripts/` to standardize the workflow:
 2. `scripts/verify_publisher_record.mjs`
    - Verifies metadata from publisher pages with domain policy and challenge detection/retries.
    - Resolves tracked email links (for example `click.skem1.com`, `el.aom.org`) to final article URLs before verification.
+   - Re-evaluates domain policy after browser navigation/redirects (for example DOI -> Wiley final URL) so publisher-specific selectors still apply on the actual article page.
    - Includes AOM/Atypon (`journals.aom.org`) metadata extraction support using `dc.*` tags + DOM fallbacks (journal breadcrumb, online date, article type).
    - Strips academic honorifics (for example `Dr.`, `Professor`) before APA author formatting.
+   - Chooses the best abstract candidate across DOM + meta tags, penalizing truncated teaser snippets (for example `...`) and common issue/TOC prompts.
    - Fast-excludes known non-article links (unsubscribe/account/privacy/technology-partner) after tracked-link resolution to avoid unnecessary browser retries.
    - Uses a ScienceDirect-aware strategy (`--sciencedirect-mode auto|curl|browser`, default `auto`):
      - `auto`: curl-first extraction from official ScienceDirect page HTML (including `__PRELOADED_STATE__`) with browser fallback only if metadata is incomplete.
@@ -208,6 +210,7 @@ Use this escalation path; stop at the first reliable method.
 
 - For unprotected domains, HTTP fetch + parser is acceptable.
 - For protected domains (often INFORMS, SAGE, Wiley), default to browser-rendered extraction.
+- When source links are DOI/tracking URLs, derive extraction policy from the navigated final page URL (not only the original URL) so Wiley/Atypon/etc. abstract selectors are applied correctly.
 - For AOM/Atypon (`journals.aom.org`), treat as protected and prefer browser extraction (CDP-attached Chrome when available). The pages often expose `dc.*` metadata that is sufficient for accurate journal/year/article-type extraction once rendered.
 - For ScienceDirect links, default to the script’s curl-first path (`--sciencedirect-mode auto`) and only fall back to browser when required metadata is incomplete.
 - For Oxford Academic (`academic.oup.com`), treat as protected and expect a temporary Cloudflare interstitial.
@@ -235,6 +238,7 @@ Challenge signals:
 - Page title includes `Just a moment`, `Access denied`, or `Attention Required`
 - URL includes challenge paths (e.g., `/cdn-cgi/`)
 - Expected article metadata/abstract is missing and interstitial text is present
+- Wiley/other publisher pages returning only teaser abstract meta descriptions (for example, truncated `...`) when a full DOM abstract exists indicates selector/policy mismatch or incomplete render.
 
 Recovery sequence:
 
