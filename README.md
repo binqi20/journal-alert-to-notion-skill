@@ -13,6 +13,8 @@
 ## Recent Improvements (v0.1.3)
 
 - Added explicit safety guards to block `unsubscribe`, `removeAlert`, and manage-alert/preferences links before verification browser navigation (including tracker links when Gmail anchor text is available).
+- Gmail extraction now blocks unsupported non-HTTP(S) schemes (for example `mailto:`) from verification candidates and records blocked-link `reason` labels in diagnostics.
+- Verifier now accepts the full `find_gmail_message.py` `*_match.json` output directly (reads `candidates[*]`) instead of requiring a manually extracted links-only JSON.
 - Added Wiley tracker-host support for `el.wiley.com` and improved tracking resolution audit fields for tracker-heavy alert emails.
 - Added a Wiley `cookieAbsent` fallback path so pre-resolution false redirects do not suppress real article verification (browser navigation retries the original tracker URL).
 - Added final-URL dedupe within a verification batch to avoid reprocessing duplicate TOC/unsubscribe links that share the same resolved destination.

@@ -43,7 +43,8 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Supports cross-domain Google cookie loading (`.google.com`, `mail.google.com`, `accounts.google.com`) and direct cookie injection for fallback.
    - Emits structured diagnostics (`search_ladder`, `attempts`, sampled rows, selected strategy, warnings).
    - Filters alert-management links at extraction time (`unsubscribe`, `removeAlert`, manage-alert/preferences anchors) so `links` and `link_details` are safe verification candidates by default.
-   - Preserves raw link capture for audit/debugging via `all_links` / `all_link_details`, and records blocked entries in `blocked_links` / `blocked_link_details`.
+   - Filters unsupported schemes (for example `mailto:`, `tel:`, `javascript:`) out of verification candidates during extraction.
+   - Preserves raw link capture for audit/debugging via `all_links` / `all_link_details`, and records blocked entries in `blocked_links` / `blocked_link_details` (with `reason` labels).
    - Dependencies:
      - `browser-cookie3` for cookie extraction (`uv pip install browser-cookie3`)
      - Python Playwright only when using `--session-fallback` (`uv pip install playwright`)
@@ -54,7 +55,9 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Includes AOM/Atypon (`journals.aom.org`) metadata extraction support using `dc.*` tags + DOM fallbacks (journal breadcrumb, online date, article type).
    - Strips academic honorifics (for example `Dr.`, `Professor`) before APA author formatting.
    - Chooses the best abstract candidate across DOM + meta tags, penalizing truncated teaser snippets (for example `...`) and common issue/TOC prompts.
+   - Accepts either a link-list JSON or the full `find_gmail_message.py` `*_match.json` output (`candidates[*]`) as verifier input.
    - Applies a hard pre-navigation guard for alert-management links (`unsubscribe`, `removeAlert`, manage-alert/preferences) before any browser navigation.
+   - Applies a hard pre-navigation guard for unsupported URL schemes (for example `mailto:`) before any browser navigation.
    - Fast-excludes known non-article links (unsubscribe/account/privacy/technology-partner) after tracked-link resolution to avoid unnecessary browser retries.
    - When input JSON includes Gmail `link_details`, uses anchor text + href to block unsubscribe/manage-alert trackers before verification ingest (prevents hidden tracker unsubscribe clicks).
    - Deduplicates repeated tracker links that converge on the same final URL within a run (for example duplicate Wiley TOC/unsubscribe links).

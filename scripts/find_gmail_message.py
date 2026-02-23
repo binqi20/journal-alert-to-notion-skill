@@ -305,11 +305,11 @@ def _normalize_link_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip().lower()
 
 
-def _is_alert_management_link(*, href: str | None, text: str | None) -> bool:
+def _alert_management_link_reason(*, href: str | None, text: str | None) -> str | None:
     href_norm = (href or "").strip().lower()
     text_norm = _normalize_link_text(text)
     if not href_norm and not text_norm:
-        return False
+        return None
 
     href_patterns = [
         r"unsubscribe",
@@ -320,7 +320,9 @@ def _is_alert_management_link(*, href: str | None, text: str | None) -> bool:
         r"notification[-_/]?preferences?",
     ]
     if any(re.search(pattern, href_norm) for pattern in href_patterns):
-        return True
+        if re.search(r"unsubscribe|removealert", href_norm):
+            return "alert_unsubscribe_link"
+        return "alert_management_preferences_link"
 
     text_patterns = [
         r"\bunsubscribe\b",
@@ -328,7 +330,34 @@ def _is_alert_management_link(*, href: str | None, text: str | None) -> bool:
         r"\b(alert|email|notification)\s+preferences?\b",
         r"\bmanage\s+preferences?\b",
     ]
-    return any(re.search(pattern, text_norm) for pattern in text_patterns)
+    if any(re.search(pattern, text_norm) for pattern in text_patterns):
+        if re.search(r"\bunsubscribe\b", text_norm):
+            return "alert_unsubscribe_link"
+        return "alert_management_preferences_link"
+    return None
+
+
+def _unsupported_link_scheme_reason(href: str | None) -> str | None:
+    raw = (href or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("//"):
+        return None
+    matched = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):", raw)
+    if not matched:
+        return None
+    scheme = matched.group(1).lower()
+    if scheme in {"http", "https"}:
+        return None
+    return "unsupported_url_scheme"
+
+
+def _blocked_link_reason(*, href: str | None, text: str | None) -> str | None:
+    return _alert_management_link_reason(href=href, text=text) or _unsupported_link_scheme_reason(href)
+
+
+def _is_alert_management_link(*, href: str | None, text: str | None) -> bool:
+    return _alert_management_link_reason(href=href, text=text) is not None
 
 
 def _build_search_query(
@@ -912,8 +941,9 @@ def _extract_message_candidate(
         normalized = {"href": href_value, "text": text_value}
         if not href_value:
             continue
-        if _is_alert_management_link(href=href_value, text=text_value):
-            blocked_link_details.append(normalized)
+        block_reason = _blocked_link_reason(href=href_value, text=text_value)
+        if block_reason:
+            blocked_link_details.append({**normalized, "reason": block_reason})
         else:
             safe_link_details.append(normalized)
 

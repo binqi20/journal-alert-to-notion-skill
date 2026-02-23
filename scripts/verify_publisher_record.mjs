@@ -428,6 +428,24 @@ function classifyUnsafeAlertManagementLink(rawUrl, linkText = "") {
   return null;
 }
 
+function classifyUnsupportedUrlScheme(rawUrl) {
+  const value = cleanText(rawUrl);
+  if (!value) return null;
+  if (/^\/\//.test(value)) return null;
+  try {
+    const u = new URL(value);
+    const scheme = String(u.protocol || "").toLowerCase();
+    if (!scheme || scheme === "http:" || scheme === "https:" || scheme === "file:") return null;
+    return "unsupported_url_scheme";
+  } catch {
+    return null;
+  }
+}
+
+function classifyUnsafePreNavigationLink(rawUrl, linkText = "") {
+  return classifyUnsafeAlertManagementLink(rawUrl, linkText) || classifyUnsupportedUrlScheme(rawUrl);
+}
+
 function classifyKnownNonArticleLink(rawUrl) {
   try {
     const u = new URL(rawUrl);
@@ -1251,7 +1269,7 @@ async function readInputUrls(inputPath) {
   const pushUrl = (value) => {
     const url = cleanText(value);
     if (!url) return;
-    const unsafeReason = classifyUnsafeAlertManagementLink(url);
+    const unsafeReason = classifyUnsafePreNavigationLink(url);
     if (unsafeReason) {
       blockedByGuard.add(`${url}::${unsafeReason}`);
       return;
@@ -1263,7 +1281,7 @@ async function readInputUrls(inputPath) {
     const href = cleanText(entry.href || entry.url || "");
     const text = cleanText(entry.text || entry.anchorText || "");
     if (!href) return;
-    const unsafeReason = classifyUnsafeAlertManagementLink(href, text);
+    const unsafeReason = classifyUnsafePreNavigationLink(href, text);
     if (unsafeReason) {
       blockedByGuard.add(`${href}::${unsafeReason}`);
       return;
@@ -1282,12 +1300,20 @@ async function readInputUrls(inputPath) {
       return;
     }
     if (typeof node === "object") {
+      if (Array.isArray(node.candidates)) {
+        // find_gmail_message.py writes links under candidates[*]; ingest them directly.
+        ingest(node.candidates);
+      }
+      const hasEmbeddedLinks =
+        Array.isArray(node.link_details) || Array.isArray(node.links) || Array.isArray(node.urls);
       let consumedLinkDetails = false;
       if (Array.isArray(node.link_details)) {
         consumedLinkDetails = true;
         for (const entry of node.link_details) pushLinkDetail(entry);
       }
-      pushUrl(node.url);
+      if (!hasEmbeddedLinks) {
+        pushUrl(node.url);
+      }
       pushUrl(node.href);
       pushUrl(node.sourceUrl);
       pushUrl(node.doiUrl);
@@ -1757,7 +1783,7 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
 
   for (let attempt = 1; attempt <= args.maxRetries; attempt += 1) {
     for (const rawTargetUrl of targets) {
-      const unsafeInputReason = classifyUnsafeAlertManagementLink(rawTargetUrl);
+      const unsafeInputReason = classifyUnsafePreNavigationLink(rawTargetUrl);
       if (unsafeInputReason) {
         return {
           ok: true,
@@ -1776,7 +1802,7 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
       const policy = policyForUrl(targetUrl);
       lastPolicy = policy;
 
-      const unsafeResolvedReason = classifyUnsafeAlertManagementLink(targetUrl);
+      const unsafeResolvedReason = classifyUnsafePreNavigationLink(targetUrl);
       if (unsafeResolvedReason) {
         rememberFinalUrl(seenFinalUrls, targetUrl);
         return {
