@@ -301,6 +301,23 @@ def _subject_matches_requested(observed: str | None, requested: str | None) -> b
     )
 
 
+def _subject_probe_phrase(subject: str) -> str:
+    normalized = _normalize_subject_text(subject).lower()
+    if ":" in normalized:
+        head = normalized.split(":", 1)[0].strip()
+        if head:
+            return head
+    return normalized
+
+
+def _subject_probe_matches(observed: str | None, requested: str) -> tuple[bool, bool]:
+    exact = _subject_matches_requested(observed, requested)
+    observed_norm = _normalize_subject_text(observed).lower()
+    probe = _subject_probe_phrase(requested)
+    broad = bool(observed_norm and probe and probe in observed_norm)
+    return exact, broad
+
+
 def _normalize_link_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip().lower()
 
@@ -791,6 +808,58 @@ def _is_inbox_like_url(url: str) -> bool:
     return "#search/" not in url and "#inbox" in url
 
 
+def _first_list_row_signature(page: Any) -> str:
+    try:
+        row = page.locator("tr.zA").first
+        if not row.count():
+            return ""
+        subject = _safe_inner_text(row.locator("span.bog").first)
+        sender = _safe_inner_text(row.locator("span.zF, span.yP").first)
+        when = _safe_attr(row.locator("td.xW span").first, "title") or _safe_inner_text(
+            row.locator("td.xW span").first
+        )
+        sig = " | ".join([subject.strip(), sender.strip(), when.strip()]).strip()
+        return sig
+    except Exception:
+        return ""
+
+
+def _wait_for_list_page_change(page: Any, *, before_signature: str, timeout_ms: int = 8000) -> bool:
+    deadline = dt.datetime.now().timestamp() + (timeout_ms / 1000.0)
+    while dt.datetime.now().timestamp() < deadline:
+        page.wait_for_timeout(250)
+        current = _first_list_row_signature(page)
+        if current and current != before_signature:
+            return True
+    return False
+
+
+def _search_results_content_looks_valid(
+    *,
+    strategy_name: str,
+    page1_rows: int,
+    page1_exact_hits: int,
+    page1_broad_hits: int,
+) -> bool:
+    if not strategy_name.startswith("search_"):
+        return True
+    if page1_rows <= 0:
+        return True
+
+    exact_subject_strategies = {
+        "search_strict_exact_subject",
+        "search_exact_subject_only",
+        "search_subject_window_no_sender",
+    }
+    if strategy_name in exact_subject_strategies:
+        return page1_exact_hits > 0
+
+    if strategy_name == "search_sender_broad_window":
+        return page1_broad_hits > 0
+
+    return True
+
+
 def _goto_mail_view(
     page: Any,
     *,
@@ -833,27 +902,53 @@ def _goto_mail_view(
 
 
 def _goto_older_page(page: Any, *, verbose: bool) -> bool:
+    before_signature = _first_list_row_signature(page)
     selectors = [
-        'div[aria-label="Older"]',
-        'div[role="button"][aria-label*="Older"]',
-        'div[data-tooltip="Older"]',
+        'button[aria-label="Older"]',
+        'button[aria-label*="Older"]',
+        '[role="button"][aria-label="Older"]',
+        '[role="button"][aria-label*="Older"]',
+        '[aria-label="Older"]',
+        '[data-tooltip="Older"]',
+        '[title="Older"]',
     ]
     for selector in selectors:
-        button = page.locator(selector).first
-        if not button.count():
+        locator = page.locator(selector)
+        count = min(locator.count(), 4)
+        if not count:
             continue
+        for idx in range(count):
+            button = locator.nth(idx)
 
-        aria_disabled = _safe_attr(button, "aria-disabled").lower()
-        class_name = _safe_attr(button, "class")
-        if aria_disabled == "true" or "aqj" in class_name:
-            return False
+            aria_disabled = _safe_attr(button, "aria-disabled").lower()
+            disabled_attr = _safe_attr(button, "disabled").lower()
+            class_name = _safe_attr(button, "class")
+            if aria_disabled == "true" or disabled_attr in {"true", "disabled"} or "aqj" in class_name:
+                continue
 
-        try:
-            button.click(timeout=5000)
-            page.wait_for_timeout(1300)
-            return True
-        except Exception:
-            continue
+            try:
+                button.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+
+            click_attempts = [
+                lambda: button.click(timeout=5000),
+                lambda: button.click(timeout=5000, force=True),
+                lambda: button.evaluate(
+                    """el => {
+                        const target = el.closest('button,[role="button"],div') || el;
+                        target.click();
+                    }"""
+                ),
+            ]
+            for click_action in click_attempts:
+                try:
+                    click_action()
+                except Exception:
+                    continue
+                if _wait_for_list_page_change(page, before_signature=before_signature, timeout_ms=7000):
+                    return True
+                page.wait_for_timeout(500)
 
     _log("No usable 'Older' button found; stopping pagination.", enabled=verbose)
     return False
@@ -994,13 +1089,19 @@ def _scan_current_view(
 ) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     sample_rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
     pages_scanned = 0
     rows_scanned = 0
+    page1_exact_subject_hits = 0
+    page1_broad_subject_hits = 0
+    page1_rows = 0
 
     for page_index in range(1, max_pages + 1):
         rows = page.locator("tr.zA")
         row_count = min(rows.count(), max_rows)
         pages_scanned += 1
+        if page_index == 1:
+            page1_rows = row_count
         _log(
             f"[{strategy_name}] scanning page {page_index}/{max_pages}, rows={row_count}",
             enabled=verbose,
@@ -1026,7 +1127,12 @@ def _scan_current_view(
                     }
                 )
 
-            if not _subject_matches_requested(row_subject, subject):
+            exact_probe_hit, broad_probe_hit = _subject_probe_matches(row_subject, subject)
+            if page_index == 1:
+                page1_exact_subject_hits += int(exact_probe_hit)
+                page1_broad_subject_hits += int(broad_probe_hit)
+
+            if not exact_probe_hit:
                 continue
 
             try:
@@ -1062,12 +1168,23 @@ def _scan_current_view(
                     "pages_scanned": pages_scanned,
                     "rows_scanned": rows_scanned,
                     "sample_rows": sample_rows,
+                    "warnings": warnings,
+                    "search_row_probe": {
+                        "page1_rows": page1_rows,
+                        "page1_exact_subject_hits": page1_exact_subject_hits,
+                        "page1_broad_subject_hits": page1_broad_subject_hits,
+                    },
                     "final_url": page.url,
                 }
 
         if page_index >= max_pages:
             break
-        if not _goto_older_page(page, verbose=verbose):
+        advanced = _goto_older_page(page, verbose=verbose)
+        if not advanced:
+            if page_index == 1 and row_count >= max_rows and max_rows > 0:
+                warnings.append(
+                    f"{strategy_name}: page 1 returned {row_count} rows but no usable Older control was found; results may be truncated just beyond page 1."
+                )
             break
 
     return {
@@ -1077,6 +1194,12 @@ def _scan_current_view(
         "pages_scanned": pages_scanned,
         "rows_scanned": rows_scanned,
         "sample_rows": sample_rows,
+        "warnings": warnings,
+        "search_row_probe": {
+            "page1_rows": page1_rows,
+            "page1_exact_subject_hits": page1_exact_subject_hits,
+            "page1_broad_subject_hits": page1_broad_subject_hits,
+        },
         "final_url": page.url,
     }
 
@@ -1135,6 +1258,7 @@ def _playwright_lookup(
     )
     attempts: list[dict[str, Any]] = []
     all_candidates: list[dict[str, Any]] = []
+    fallback_warnings: list[str] = []
 
     with sync_playwright() as playwright:
         browser_instance = None
@@ -1201,6 +1325,7 @@ def _playwright_lookup(
                     "final_url": None,
                     "search_applied": None,
                     "inbox_like": None,
+                    "content_mismatch": False,
                     "pages_scanned": 0,
                     "rows_scanned": 0,
                     "sample_rows": [],
@@ -1245,6 +1370,28 @@ def _playwright_lookup(
                     attempt["sample_rows"] = scan.get("sample_rows", [])
                     attempt["candidate_count"] = len(scan.get("candidates", []))
                     attempt["final_url"] = scan.get("final_url")
+                    attempt_warnings = [str(x) for x in scan.get("warnings", []) if str(x)]
+                    if attempt_warnings:
+                        attempt["warnings"] = attempt_warnings
+                        fallback_warnings.extend(
+                            [w for w in attempt_warnings if w not in fallback_warnings]
+                        )
+                    probe = scan.get("search_row_probe") or {}
+                    attempt["search_row_probe"] = probe
+                    if strategy.get("mode") in {"search", "search_input"} and not _search_results_content_looks_valid(
+                        strategy_name=str(strategy.get("name") or ""),
+                        page1_rows=int(probe.get("page1_rows") or 0),
+                        page1_exact_hits=int(probe.get("page1_exact_subject_hits") or 0),
+                        page1_broad_hits=int(probe.get("page1_broad_subject_hits") or 0),
+                    ):
+                        attempt["content_mismatch"] = True
+                        attempt["search_applied"] = False
+                        mismatch_warning = (
+                            f"{strategy.get('name')}: Gmail URL looked like search mode, but first-page row content did not match the expected query subject pattern."
+                        )
+                        if mismatch_warning not in fallback_warnings:
+                            fallback_warnings.append(mismatch_warning)
+                        continue
 
                     all_candidates.extend(scan.get("candidates", []))
                     if scan.get("found"):
@@ -1256,6 +1403,7 @@ def _playwright_lookup(
                             "candidates": deduped,
                             "attempts": attempts,
                             "strategy": strategy.get("name"),
+                            "warnings": fallback_warnings,
                         }
                 except Exception as exc:
                     attempt["error"] = str(exc)
@@ -1268,6 +1416,7 @@ def _playwright_lookup(
                 "candidates": deduped,
                 "attempts": attempts,
                 "strategy": None,
+                "warnings": fallback_warnings,
             }
         finally:
             if browser_instance is not None:
@@ -1415,6 +1564,10 @@ def main() -> None:
             payload["candidates"] = _dedupe_candidates(atom_candidates + fallback_candidates)
             payload["attempts"] = fallback.get("attempts", [])
             payload["strategy"] = fallback.get("strategy")
+            for item in fallback.get("warnings", []) or []:
+                text = str(item).strip()
+                if text and text not in warnings:
+                    warnings.append(text)
             if fallback.get("found"):
                 payload["found"] = True
                 payload["method"] = "playwright_session"

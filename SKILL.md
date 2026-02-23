@@ -37,8 +37,9 @@ Use these scripts under `scripts/` to standardize the workflow:
      - inbox crawl,
      - all-mail crawl.
    - Supports search-input fallback mode when hash search routes are unreliable.
-   - Validates whether Gmail search was actually applied (not silently left in inbox-like state).
+   - Validates whether Gmail search was actually applied using both URL state and first-page row-content checks (to catch false `#search/...` views showing inbox-like rows).
    - Supports pagination via `--max-pages` and relaxed date fallback via `--date-window-days`.
+   - Uses hardened Gmail `Older` pagination selectors/click fallbacks and emits warnings when page-1 results are likely truncated (for example exactly `--max-rows` rows but no usable `Older` control).
    - Handles Gmail localized timestamp formats (including narrow-space AM/PM strings).
    - Supports cross-domain Google cookie loading (`.google.com`, `mail.google.com`, `accounts.google.com`) and direct cookie injection for fallback.
    - Emits structured diagnostics (`search_ladder`, `attempts`, sampled rows, selected strategy, warnings).
@@ -204,6 +205,8 @@ Use this escalation path; stop at the first reliable method.
 - Prefer resilient selectors (`role`, `aria-label`, semantic landmarks) over brittle class names.
 - Wait for stable render (`networkidle` plus explicit content checks).
 - Prefer concrete Gmail surface readiness checks (rows/message header/search input) before `networkidle`; use `networkidle` only as a short fallback because Gmail often keeps background requests alive.
+- Validate search state using row-content heuristics (not URL state alone) when Gmail appears to keep inbox-like rows under a `#search/...` URL.
+- Treat `page 1 returned <max_rows> rows but no usable Older control` as a likely pagination truncation warning and downgrade strategy/fallback accordingly.
 - If needed, switch between hash-route search and search-input (`Enter`) fallback mode.
 - Persist diagnostics for each attempt:
   - strategy name,
