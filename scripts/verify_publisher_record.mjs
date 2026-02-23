@@ -109,6 +109,7 @@ const CHALLENGE_TERMS = [
 
 const TRACKING_HOST_PATTERNS = [
   /(^|\.)el\.aom\.org$/i,
+  /(^|\.)el\.wiley\.com$/i,
   /(^|\.)click\.skem1\.com$/i,
   /(^|\.)lnk\.springernature\.com$/i,
   /(^|\.)link\.mail\.elsevier\.com$/i,
@@ -418,11 +419,72 @@ function classifyKnownNonArticleLink(rawUrl) {
     if (/(^|\.)aom\.org$/.test(host) && !/(^|\.)journals\.aom\.org$/.test(host)) {
       return "aom_marketing_or_policy_link";
     }
+    if (/(^|\.)onlinelibrary\.wiley\.com$/.test(host)) {
+      if (/^\/doi\//i.test(pathName)) {
+        return null;
+      }
+      if (/^\/action\/removealert/i.test(pathName)) {
+        return "wiley_alert_management_link";
+      }
+      if (/^\/action\//i.test(pathName)) {
+        return "wiley_non_article_action_link";
+      }
+      if (/^\/toc\//i.test(pathName)) {
+        return "wiley_toc_or_issue_link";
+      }
+      if (/^\/journal\//i.test(pathName)) {
+        return "wiley_journal_home_link";
+      }
+      if (pathName === "/" || pathName === "") {
+        return "wiley_marketing_or_home_link";
+      }
+    }
     if (/(^|\.)atypon\.com$/.test(host)) return "technology_partner_link";
     return null;
   } catch {
     return null;
   }
+}
+
+function normalizeFinalUrlForRunDedupe(rawUrl) {
+  try {
+    const u = new URL(maybeCanonicalArticleUrl(rawUrl));
+    u.hash = "";
+    const dropParams = [];
+    for (const [key] of u.searchParams.entries()) {
+      if (
+        /^utm_/i.test(key) ||
+        /^mc_/i.test(key) ||
+        /^campaign$/i.test(key) ||
+        /^source$/i.test(key)
+      ) {
+        dropParams.push(key);
+      }
+    }
+    for (const key of dropParams) {
+      u.searchParams.delete(key);
+    }
+    const query = u.searchParams.toString();
+    return `${u.origin}${u.pathname}${query ? `?${query}` : ""}`;
+  } catch {
+    return "";
+  }
+}
+
+function shouldSkipDuplicateFinalUrl(seenFinalUrls, rawUrl, inputUrl) {
+  if (!seenFinalUrls) return false;
+  const key = normalizeFinalUrlForRunDedupe(rawUrl);
+  if (!key) return false;
+  if (isTrackingUrl(rawUrl)) return false;
+  if (normalizeFinalUrlForRunDedupe(inputUrl) === key) return false;
+  return seenFinalUrls.has(key);
+}
+
+function rememberFinalUrl(seenFinalUrls, rawUrl) {
+  if (!seenFinalUrls) return;
+  const key = normalizeFinalUrlForRunDedupe(rawUrl);
+  if (!key) return;
+  seenFinalUrls.add(key);
 }
 
 async function resolveTrackedUrl(inputUrl, args) {
@@ -450,6 +512,27 @@ async function resolveTrackedUrl(inputUrl, args) {
     });
     clearTimeout(timer);
     const resolvedUrl = maybeCanonicalArticleUrl(response.url || inputUrl);
+    const resolvedHost = hostForUrl(resolvedUrl);
+    let resolvedPath = "";
+    try {
+      resolvedPath = new URL(resolvedUrl).pathname || "";
+    } catch {
+      resolvedPath = "";
+    }
+    if (
+      /(^|\.)el\.wiley\.com$/i.test(hostForUrl(inputUrl)) &&
+      /(^|\.)onlinelibrary\.wiley\.com$/i.test(resolvedHost) &&
+      /^\/action\/cookieAbsent$/i.test(resolvedPath)
+    ) {
+      return {
+        inputUrl,
+        resolvedUrl: inputUrl,
+        usedTrackingResolution: true,
+        trackingStatus: response.status,
+        trackingResolutionError:
+          "Tracker pre-resolution landed on Wiley cookieAbsent endpoint; ignoring and falling back to browser navigation.",
+      };
+    }
     return {
       inputUrl,
       resolvedUrl,
@@ -1604,7 +1687,7 @@ async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolved
   return { ok: false, errors };
 }
 
-async function verifySingleUrl(getContext, inputUrl, args) {
+async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null) {
   const canonical = normalizeDoi(inputUrl);
   const targets = uniqueStrings([inputUrl, canonical]);
   const backoffMs = [2000, 5000, 10000];
@@ -1618,8 +1701,21 @@ async function verifySingleUrl(getContext, inputUrl, args) {
       const policy = policyForUrl(targetUrl);
       lastPolicy = policy;
 
+      if (shouldSkipDuplicateFinalUrl(seenFinalUrls, targetUrl, inputUrl)) {
+        return {
+          ok: true,
+          record: buildExcludedLinkRecord(
+            inputUrl,
+            targetUrl,
+            policy,
+            "duplicate_final_url_in_batch",
+            resolved
+          ),
+        };
+      }
       const nonArticleReason = classifyKnownNonArticleLink(targetUrl);
       if (nonArticleReason) {
+        rememberFinalUrl(seenFinalUrls, targetUrl);
         return {
           ok: true,
           record: buildExcludedLinkRecord(inputUrl, targetUrl, policy, nonArticleReason, resolved),
@@ -1647,6 +1743,28 @@ async function verifySingleUrl(getContext, inputUrl, args) {
             args.sciencedirectMode === "curl" ||
             curlResult.record.ingestDecision === "exclude"
           ) {
+            if (
+              shouldSkipDuplicateFinalUrl(
+                seenFinalUrls,
+                curlResult.record.resolvedUrl || curlResult.record.finalUrl || targetUrl,
+                inputUrl
+              )
+            ) {
+              return {
+                ok: true,
+                record: buildExcludedLinkRecord(
+                  inputUrl,
+                  curlResult.record.resolvedUrl || curlResult.record.finalUrl || targetUrl,
+                  policyForUrl(curlResult.record.resolvedUrl || curlResult.record.finalUrl || targetUrl),
+                  "duplicate_final_url_in_batch",
+                  resolved
+                ),
+              };
+            }
+            rememberFinalUrl(
+              seenFinalUrls,
+              curlResult.record.resolvedUrl || curlResult.record.finalUrl || targetUrl
+            );
             return { ok: true, record: curlResult.record };
           }
           errors.push({
@@ -1709,8 +1827,20 @@ async function verifySingleUrl(getContext, inputUrl, args) {
         const effectivePolicy = policyForUrl(navigatedUrl || targetUrl);
         lastPolicy = effectivePolicy;
 
+        if (shouldSkipDuplicateFinalUrl(seenFinalUrls, navigatedUrl || targetUrl, inputUrl)) {
+          const record = buildExcludedLinkRecord(
+            inputUrl,
+            navigatedUrl || targetUrl,
+            effectivePolicy,
+            "duplicate_final_url_in_batch",
+            resolved
+          );
+          await page.close();
+          return { ok: true, record };
+        }
         const nonArticleAfterNav = classifyKnownNonArticleLink(navigatedUrl);
         if (nonArticleAfterNav) {
+          rememberFinalUrl(seenFinalUrls, navigatedUrl || targetUrl);
           const record = buildExcludedLinkRecord(
             inputUrl,
             navigatedUrl || targetUrl,
@@ -1736,6 +1866,10 @@ async function verifySingleUrl(getContext, inputUrl, args) {
           error: resolved.trackingResolutionError || "",
         };
         record.verifiedAt = new Date().toISOString();
+        record.navigationResolved = Boolean(
+          navigatedUrl && normalizeFinalUrlForRunDedupe(navigatedUrl) !== normalizeFinalUrlForRunDedupe(targetUrl)
+        );
+        rememberFinalUrl(seenFinalUrls, record.resolvedUrl || record.finalUrl || navigatedUrl || targetUrl);
         await page.close();
         return { ok: true, record };
       } catch (error) {
@@ -1868,9 +2002,10 @@ async function main() {
   };
 
   let results = [];
+  const seenFinalUrls = new Set();
   try {
     results = await mapLimit(urls, args.concurrency, async (url) => {
-      return verifySingleUrl(getContext, url, args);
+      return verifySingleUrl(getContext, url, args, seenFinalUrls);
     });
   } finally {
     if (browserState) {

@@ -10,6 +10,14 @@
 - DOI normalization + duplicate-safe Notion payload planning.
 - Structured diagnostics for reproducible runs (`search_ladder`, `attempts`, warnings).
 
+## Recent Improvements (v0.1.3)
+
+- Added Wiley tracker-host support for `el.wiley.com` and improved tracking resolution audit fields for tracker-heavy alert emails.
+- Added a Wiley `cookieAbsent` fallback path so pre-resolution false redirects do not suppress real article verification (browser navigation retries the original tracker URL).
+- Added final-URL dedupe within a verification batch to avoid reprocessing duplicate TOC/unsubscribe links that share the same resolved destination.
+- Gmail helper now emits `link_details` (`href` + anchor text) alongside `links` to enable cheaper pre-filtering and better diagnostics.
+- Validated live against a Strategic Management Journal Early View alert (Feb 16, 2026) with Wiley tracker links.
+
 ## Recent Improvements (v0.1.2)
 
 - Fixed incomplete/truncated abstracts on Wiley article pages (including SMJ) by preferring full DOM abstract sections over teaser meta descriptions.

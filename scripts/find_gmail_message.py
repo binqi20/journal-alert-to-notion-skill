@@ -855,11 +855,21 @@ def _extract_message_candidate(
             parsed_datetimes.append(row_parsed)
 
     try:
-        links = page.locator("div.a3s a[href]").evaluate_all(
-            "nodes => nodes.map(n => n.href).filter(Boolean)"
+        link_details = page.locator("div.a3s a[href]").evaluate_all(
+            """nodes => nodes
+                .map(n => ({
+                    href: n.href || "",
+                    text: (n.textContent || "").replace(/\\s+/g, " ").trim()
+                }))
+                .filter(item => item.href)"""
         )
     except Exception:
-        links = []
+        link_details = []
+    links = [str(item.get("href") or "").strip() for item in link_details if isinstance(item, dict)] or []
+    if not links and link_details:
+        # Defensive fallback in case Playwright returns a list of href strings from older runtimes.
+        links = [str(item).strip() for item in link_details if str(item).strip()]
+        link_details = [{"href": href, "text": ""} for href in links]
 
     body_text = None
     if include_body:
@@ -879,6 +889,7 @@ def _extract_message_candidate(
         "minute_match": minute_match,
         "url": page.url,
         "links": links,
+        "link_details": link_details,
     }
     if include_body:
         candidate["body_text"] = body_text
