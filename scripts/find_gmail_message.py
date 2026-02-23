@@ -301,6 +301,36 @@ def _subject_matches_requested(observed: str | None, requested: str | None) -> b
     )
 
 
+def _normalize_link_text(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip().lower()
+
+
+def _is_alert_management_link(*, href: str | None, text: str | None) -> bool:
+    href_norm = (href or "").strip().lower()
+    text_norm = _normalize_link_text(text)
+    if not href_norm and not text_norm:
+        return False
+
+    href_patterns = [
+        r"unsubscribe",
+        r"removealert",
+        r"manage[-_/]?alerts?",
+        r"alert[-_/]?preferences?",
+        r"email[-_/]?(notification[-_/]?)?preferences?",
+        r"notification[-_/]?preferences?",
+    ]
+    if any(re.search(pattern, href_norm) for pattern in href_patterns):
+        return True
+
+    text_patterns = [
+        r"\bunsubscribe\b",
+        r"\bmanage\s+(my\s+)?alerts?\b",
+        r"\b(alert|email|notification)\s+preferences?\b",
+        r"\bmanage\s+preferences?\b",
+    ]
+    return any(re.search(pattern, text_norm) for pattern in text_patterns)
+
+
 def _build_search_query(
     *,
     subject: str | None,
@@ -865,11 +895,30 @@ def _extract_message_candidate(
         )
     except Exception:
         link_details = []
-    links = [str(item.get("href") or "").strip() for item in link_details if isinstance(item, dict)] or []
-    if not links and link_details:
+    all_link_details = link_details
+    all_links = [str(item.get("href") or "").strip() for item in all_link_details if isinstance(item, dict)] or []
+    if not all_links and all_link_details:
         # Defensive fallback in case Playwright returns a list of href strings from older runtimes.
-        links = [str(item).strip() for item in link_details if str(item).strip()]
-        link_details = [{"href": href, "text": ""} for href in links]
+        all_links = [str(item).strip() for item in all_link_details if str(item).strip()]
+        all_link_details = [{"href": href, "text": ""} for href in all_links]
+
+    blocked_link_details: list[dict[str, str]] = []
+    safe_link_details: list[dict[str, str]] = []
+    for item in all_link_details:
+        if not isinstance(item, dict):
+            continue
+        href_value = str(item.get("href") or "").strip()
+        text_value = str(item.get("text") or "").strip()
+        normalized = {"href": href_value, "text": text_value}
+        if not href_value:
+            continue
+        if _is_alert_management_link(href=href_value, text=text_value):
+            blocked_link_details.append(normalized)
+        else:
+            safe_link_details.append(normalized)
+
+    links = [item["href"] for item in safe_link_details]
+    blocked_links = [item["href"] for item in blocked_link_details]
 
     body_text = None
     if include_body:
@@ -889,7 +938,11 @@ def _extract_message_candidate(
         "minute_match": minute_match,
         "url": page.url,
         "links": links,
-        "link_details": link_details,
+        "link_details": safe_link_details,
+        "all_links": all_links,
+        "all_link_details": all_link_details,
+        "blocked_links": blocked_links,
+        "blocked_link_details": blocked_link_details,
     }
     if include_body:
         candidate["body_text"] = body_text

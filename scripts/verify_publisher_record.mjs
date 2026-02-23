@@ -394,6 +394,40 @@ function inferJournalFallback({ journal, pageTitle, finalUrl, doiUrl }) {
   return "";
 }
 
+function classifyUnsafeAlertManagementLink(rawUrl, linkText = "") {
+  const urlLower = String(rawUrl || "").toLowerCase();
+  const textLower = cleanText(linkText).toLowerCase();
+  if (!urlLower && !textLower) return null;
+
+  const hrefMatches = (patterns) => patterns.some((pattern) => pattern.test(urlLower));
+  const textMatches = (patterns) => patterns.some((pattern) => pattern.test(textLower));
+
+  if (
+    hrefMatches([/unsubscribe/i, /removealert/i]) ||
+    textMatches([/\bunsubscribe\b/i])
+  ) {
+    return "alert_unsubscribe_link";
+  }
+
+  if (
+    hrefMatches([
+      /manage[-_/?=&%]*alerts?/i,
+      /alert[-_/?=&%]*preferences?/i,
+      /email[-_/?=&%]*(notification[-_/?=&%]*)?preferences?/i,
+      /notification[-_/?=&%]*preferences?/i,
+    ]) ||
+    textMatches([
+      /\bmanage\s+(my\s+)?alerts?\b/i,
+      /\b(alert|email|notification)\s+preferences?\b/i,
+      /\bmanage\s+preferences?\b/i,
+    ])
+  ) {
+    return "alert_management_preferences_link";
+  }
+
+  return null;
+}
+
 function classifyKnownNonArticleLink(rawUrl) {
   try {
     const u = new URL(rawUrl);
@@ -1213,10 +1247,28 @@ async function readInputUrls(inputPath) {
   const parsed = JSON.parse(raw);
 
   const urls = [];
+  const blockedByGuard = new Set();
   const pushUrl = (value) => {
     const url = cleanText(value);
     if (!url) return;
+    const unsafeReason = classifyUnsafeAlertManagementLink(url);
+    if (unsafeReason) {
+      blockedByGuard.add(`${url}::${unsafeReason}`);
+      return;
+    }
     urls.push(url);
+  };
+  const pushLinkDetail = (entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const href = cleanText(entry.href || entry.url || "");
+    const text = cleanText(entry.text || entry.anchorText || "");
+    if (!href) return;
+    const unsafeReason = classifyUnsafeAlertManagementLink(href, text);
+    if (unsafeReason) {
+      blockedByGuard.add(`${href}::${unsafeReason}`);
+      return;
+    }
+    urls.push(href);
   };
 
   const ingest = (node) => {
@@ -1230,11 +1282,20 @@ async function readInputUrls(inputPath) {
       return;
     }
     if (typeof node === "object") {
+      let consumedLinkDetails = false;
+      if (Array.isArray(node.link_details)) {
+        consumedLinkDetails = true;
+        for (const entry of node.link_details) pushLinkDetail(entry);
+      }
       pushUrl(node.url);
+      pushUrl(node.href);
       pushUrl(node.sourceUrl);
       pushUrl(node.doiUrl);
       if (Array.isArray(node.urls)) {
         for (const u of node.urls) pushUrl(u);
+      }
+      if (!consumedLinkDetails && Array.isArray(node.links)) {
+        for (const u of node.links) pushUrl(u);
       }
       if (Array.isArray(node.records)) ingest(node.records);
       if (Array.isArray(node.results)) ingest(node.results);
@@ -1696,11 +1757,33 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
 
   for (let attempt = 1; attempt <= args.maxRetries; attempt += 1) {
     for (const rawTargetUrl of targets) {
+      const unsafeInputReason = classifyUnsafeAlertManagementLink(rawTargetUrl);
+      if (unsafeInputReason) {
+        return {
+          ok: true,
+          record: buildExcludedLinkRecord(
+            inputUrl,
+            rawTargetUrl,
+            policyForUrl(rawTargetUrl),
+            unsafeInputReason,
+            null
+          ),
+        };
+      }
+
       const resolved = await resolveTrackedUrl(rawTargetUrl, args);
       const targetUrl = resolved.resolvedUrl;
       const policy = policyForUrl(targetUrl);
       lastPolicy = policy;
 
+      const unsafeResolvedReason = classifyUnsafeAlertManagementLink(targetUrl);
+      if (unsafeResolvedReason) {
+        rememberFinalUrl(seenFinalUrls, targetUrl);
+        return {
+          ok: true,
+          record: buildExcludedLinkRecord(inputUrl, targetUrl, policy, unsafeResolvedReason, resolved),
+        };
+      }
       if (shouldSkipDuplicateFinalUrl(seenFinalUrls, targetUrl, inputUrl)) {
         return {
           ok: true,
