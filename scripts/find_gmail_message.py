@@ -279,6 +279,28 @@ def _escape_query_phrase(value: str) -> str:
     return value.replace('"', '\\"')
 
 
+def _normalize_subject_text(value: str | None) -> str:
+    text = (value or "").replace("\u202f", " ").replace("\xa0", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_terminal_subject_punctuation(value: str) -> str:
+    return re.sub(r"[\s.!?。！？…]+$", "", value).strip()
+
+
+def _subject_matches_requested(observed: str | None, requested: str | None) -> bool:
+    observed_norm = _normalize_subject_text(observed)
+    requested_norm = _normalize_subject_text(requested)
+    if not observed_norm or not requested_norm:
+        return False
+    if observed_norm == requested_norm:
+        return True
+    # Gmail subjects in the UI/feed may differ only by trailing punctuation.
+    return _strip_terminal_subject_punctuation(observed_norm) == _strip_terminal_subject_punctuation(
+        requested_norm
+    )
+
+
 def _build_search_query(
     *,
     subject: str | None,
@@ -573,7 +595,7 @@ def _select_atom_match(
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     for entry in entries:
-        if entry.get("title", "") != subject:
+        if not _subject_matches_requested(str(entry.get("title") or ""), subject):
             continue
         issued_dt = _parse_atom_datetime(entry.get("issued")) or _parse_atom_datetime(
             entry.get("modified")
@@ -646,6 +668,45 @@ def _safe_attr(locator: Any, attr: str) -> str:
     return (value or "").strip()
 
 
+def _wait_for_gmail_surface(page: Any, *, verbose: bool, phase: str) -> None:
+    # Gmail often keeps background requests alive, so `networkidle` is an unreliable
+    # primary readiness signal. Prefer concrete UI surface checks and only fall back
+    # to a short networkidle wait when selectors are still missing.
+    ready_selector = ",".join(
+        [
+            "tr.zA",
+            "h2.hP",
+            'input[aria-label="Search mail"]',
+            'input[name="q"]',
+        ]
+    )
+    try:
+        page.wait_for_selector(ready_selector, state="attached", timeout=6000)
+        page.wait_for_timeout(400)
+        return
+    except Exception:
+        _log(
+            f"Gmail surface selectors not ready after navigation ({phase}); trying short networkidle fallback.",
+            enabled=verbose,
+        )
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        _log(
+            f"networkidle timeout after Gmail {phase}; continuing with selector retry.",
+            enabled=verbose,
+        )
+    try:
+        page.wait_for_selector(ready_selector, state="attached", timeout=3000)
+    except Exception:
+        _log(
+            f"Gmail surface selectors still not ready after fallback ({phase}); continuing.",
+            enabled=verbose,
+        )
+    page.wait_for_timeout(500)
+
+
 def _gmail_view_url(
     *,
     mailbox: str,
@@ -682,11 +743,7 @@ def _goto_mail_view(
 ) -> dict[str, Any]:
     target_url = _gmail_view_url(mailbox=mailbox, mode=mode, query=query, folder=folder)
     page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except Exception:
-        _log("networkidle timeout after Gmail navigation; continuing.", enabled=verbose)
-    page.wait_for_timeout(1400)
+    _wait_for_gmail_surface(page, verbose=verbose, phase="navigation")
 
     current_url = page.url
     result: dict[str, Any] = {
@@ -705,11 +762,7 @@ def _goto_mail_view(
         search_input.click(timeout=10000)
         search_input.fill(query, timeout=10000)
         search_input.press("Enter")
-        try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            _log("networkidle timeout after input search; continuing.", enabled=verbose)
-        page.wait_for_timeout(1400)
+        _wait_for_gmail_surface(page, verbose=verbose, phase="input search")
         current_url = page.url
         result["current_url"] = current_url
         result["search_applied"] = "#search/" in current_url or "?q=" in current_url
@@ -879,7 +932,7 @@ def _scan_current_view(
                     }
                 )
 
-            if row_subject != subject:
+            if not _subject_matches_requested(row_subject, subject):
                 continue
 
             try:
@@ -901,7 +954,7 @@ def _scan_current_view(
             )
             candidates.append(candidate)
             match_hit = (
-                candidate.get("subject") == subject
+                _subject_matches_requested(str(candidate.get("subject") or ""), subject)
                 and bool(candidate.get("minute_match"))
                 and bool(candidate.get("sender_match"))
             )

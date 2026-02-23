@@ -71,6 +71,18 @@ const DOMAIN_POLICIES = [
     ],
   },
   {
+    name: "aom_atypon",
+    hostPattern: /(^|\.)journals\.aom\.org$/i,
+    protected: true,
+    abstractSelectors: [
+      "div.hlFld-Abstract",
+      "div.abstractSection.abstractInFull",
+      "section.abstract",
+      "#abstract",
+      "div.abstract",
+    ],
+  },
+  {
     name: "doi",
     hostPattern: /(^|\.)doi\.org$/i,
     protected: false,
@@ -96,11 +108,21 @@ const CHALLENGE_TERMS = [
 ];
 
 const TRACKING_HOST_PATTERNS = [
+  /(^|\.)el\.aom\.org$/i,
   /(^|\.)click\.skem1\.com$/i,
   /(^|\.)lnk\.springernature\.com$/i,
   /(^|\.)link\.mail\.elsevier\.com$/i,
   /(^|\.)click\.notification\.elsevier\.com$/i,
 ];
+
+const AOM_DOI_JOURNAL_BY_PREFIX = {
+  amj: "Academy of Management Journal",
+  amd: "Academy of Management Discoveries",
+  amr: "Academy of Management Review",
+  amp: "Academy of Management Perspectives",
+  annals: "Academy of Management Annals",
+  amle: "Academy of Management Learning & Education",
+};
 
 const INCLUDE_ARTICLE_TYPES = new Set(["research-article", "research-paper", "editorial"]);
 const EXCLUDE_ARTICLE_TYPES = new Set([
@@ -345,6 +367,64 @@ function maybeCanonicalArticleUrl(rawUrl) {
   }
 }
 
+function aomJournalFromDoi(doiUrl) {
+  const doi = normalizeDoi(doiUrl);
+  const match = doi.match(/10\.5465\/([a-z]+)\./i);
+  if (!match) return "";
+  return AOM_DOI_JOURNAL_BY_PREFIX[String(match[1]).toLowerCase()] || "";
+}
+
+function inferJournalFallback({ journal, pageTitle, finalUrl, doiUrl }) {
+  const direct = cleanText(journal);
+  if (direct) return direct;
+
+  const fromDoi = aomJournalFromDoi(doiUrl);
+  if (fromDoi) return fromDoi;
+
+  const title = cleanText(pageTitle);
+  if (title.includes("|")) {
+    const maybeJournal = cleanText(title.split("|").slice(1).join("|")).replace(/\s+In-Press$/i, "");
+    if (maybeJournal) return maybeJournal;
+  }
+
+  if (/(^|\.)journals\.aom\.org$/i.test(hostForUrl(finalUrl || ""))) {
+    return "Academy of Management [Not verified]";
+  }
+  return "";
+}
+
+function classifyKnownNonArticleLink(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+    const pathName = u.pathname || "/";
+
+    if (/(^|\.)journals\.aom\.org$/.test(host)) {
+      if (/^\/doi\//i.test(pathName)) {
+        return null;
+      }
+      if (/^\/action\/removealert/i.test(pathName)) {
+        return "aom_alert_management_link";
+      }
+      if (/^\/action\/showlogin/i.test(pathName) || /^\/s\/login/i.test(pathName)) {
+        return "aom_login_link";
+      }
+      if (/^\/action\//i.test(pathName)) {
+        return "aom_non_article_action_link";
+      }
+    }
+
+    if (/(^|\.)myaccount\.aom\.org$/.test(host)) return "aom_account_link";
+    if (/(^|\.)aom\.org$/.test(host) && !/(^|\.)journals\.aom\.org$/.test(host)) {
+      return "aom_marketing_or_policy_link";
+    }
+    if (/(^|\.)atypon\.com$/.test(host)) return "technology_partner_link";
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveTrackedUrl(inputUrl, args) {
   if (args.skipTrackingResolution || !isTrackingUrl(inputUrl)) {
     return {
@@ -392,8 +472,15 @@ function parseYear(value) {
   return m ? m[0] : "";
 }
 
+function stripAcademicHonorifics(name) {
+  return cleanText(name)
+    .replace(/^(dr|professor|prof|mr|mrs|ms)\.?\s+/i, "")
+    .replace(/\s*,?\s*(ph\.?\s*d\.?|m\.?\s*d\.?|dba|mba|jd)\s*$/i, "")
+    .trim();
+}
+
 function formatApaAuthor(name) {
-  const cleaned = cleanText(name);
+  const cleaned = stripAcademicHonorifics(name);
   if (!cleaned) return "";
   const parts = cleaned.split(/\s+/).filter(Boolean);
   if (parts.length === 1) return parts[0];
@@ -451,13 +538,13 @@ function buildApaCitation(record) {
   const hasIssue = !isNotVerifiedValue(issue);
   const hasPageRange = !isNotVerifiedValue(pageRange);
   const hasPublishedOnline = !isNotVerifiedValue(record.publishedOnline);
+  if (!hasVolume && !hasIssue && !hasPageRange && hasPublishedOnline) {
+    return `${authors} (${year}). ${title}. ${journal}. Advance online publication. ${doiUrl}`;
+  }
   const volumeIssue = hasVolume ? (hasIssue ? `${volume}(${issue})` : volume) : "";
   const publicationTailParts = [];
   if (volumeIssue) publicationTailParts.push(volumeIssue);
   if (hasPageRange) publicationTailParts.push(pageRange);
-  if (!volumeIssue && !hasPageRange && hasPublishedOnline) {
-    publicationTailParts.push("Advance online publication");
-  }
   const publicationTail = publicationTailParts.join(", ");
   if (!publicationTail) {
     return "[Not verified]";
@@ -1114,14 +1201,24 @@ function buildRecordFromExtracted(extracted, sourceUrl) {
     normalizeDoi(extracted?.doiMeta) ||
     normalizeDoi(extractDoiFromText(extracted?.finalUrl || "")) ||
     normalizeDoi(extractDoiFromText(sourceUrl));
+  const normalizedTitle = cleanText(extracted?.title).replace(
+    /\s+\|\s+Academy of Management .*$/i,
+    ""
+  );
+  const inferredJournal = inferJournalFallback({
+    journal: extracted?.journal,
+    pageTitle: extracted?.pageTitle,
+    finalUrl: extracted?.finalUrl,
+    doiUrl,
+  });
   const year = parseYear(extracted?.publicationDate || "");
   const normalized = {
     sourceUrl: sourceUrl,
     finalUrl: extracted?.finalUrl || sourceUrl,
-    title: ensureField(extracted?.title),
+    title: ensureField(normalizedTitle),
     authors: uniqueStrings(extracted?.authors || []),
     year: ensureField(year),
-    journal: ensureField(extracted?.journal),
+    journal: ensureField(inferredJournal || extracted?.journal),
     volume: ensureField(extracted?.volume),
     issue: ensureField(extracted?.issue),
     pageRange: ensureField(extracted?.pageRange),
@@ -1151,21 +1248,29 @@ function buildRecordFromExtracted(extracted, sourceUrl) {
 async function extractMetadata(page, sourceUrl, policy) {
   const selectors = policy.abstractSelectors || [];
   const extracted = await page.evaluate((abstractSelectors) => {
+    const metaIndex = (() => {
+      const index = new Map();
+      const push = (key, value) => {
+        const normalizedKey = String(key || "").trim().toLowerCase();
+        const normalizedValue = String(value || "").replace(/\s+/g, " ").trim();
+        if (!normalizedKey || !normalizedValue) return;
+        const existing = index.get(normalizedKey) || [];
+        existing.push(normalizedValue);
+        index.set(normalizedKey, existing);
+      };
+      for (const node of document.querySelectorAll("meta[name], meta[property]")) {
+        push(node.getAttribute("name"), node.getAttribute("content"));
+        push(node.getAttribute("property"), node.getAttribute("content"));
+      }
+      return index;
+    })();
+
     const readMetaValues = (names) => {
       const values = [];
       for (const name of names) {
-        const selectors = [
-          `meta[name="${name}"]`,
-          `meta[property="${name}"]`,
-          `meta[name="${name.toLowerCase()}"]`,
-          `meta[property="${name.toLowerCase()}"]`,
-        ];
-        for (const sel of selectors) {
-          const nodes = document.querySelectorAll(sel);
-          for (const node of nodes) {
-            const value = (node.getAttribute("content") || "").trim();
-            if (value) values.push(value);
-          }
+        const fromIndex = metaIndex.get(String(name || "").toLowerCase()) || [];
+        for (const value of fromIndex) {
+          if (value) values.push(value);
         }
       }
       return values;
@@ -1214,6 +1319,21 @@ async function extractMetadata(page, sourceUrl, policy) {
         "dc.source",
       ])[0];
       if (fromMeta) return fromMeta;
+      const fromAtyponBreadcrumb = Array.from(
+        document.querySelectorAll(".article__breadcrumbs a, .article__breadcrumbs span")
+      )
+        .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+        .map((value) => value.replace(/\s+In-Press$/i, ""))
+        .find((value) => /academy of management/i.test(value));
+      if (fromAtyponBreadcrumb) return fromAtyponBreadcrumb;
+      const fromTitleSuffix = (document.title || "")
+        .split("|")
+        .slice(1)
+        .join("|")
+        .replace(/\s+/g, " ")
+        .replace(/\s+In-Press$/i, "")
+        .trim();
+      if (fromTitleSuffix) return fromTitleSuffix;
       return pickText([
         ".publication-title",
         ".journal-title",
@@ -1229,6 +1349,9 @@ async function extractMetadata(page, sourceUrl, policy) {
       "prism.publicationDate",
       "article:published_time",
     ])[0];
+    if (!pubDate) {
+      pubDate = pickText([".epub-section__date", ".publication-date", ".article-header__date"]);
+    }
     let jsonLdType = "";
     const jsonLdNodes = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
     for (const node of jsonLdNodes) {
@@ -1286,6 +1409,7 @@ async function extractMetadata(page, sourceUrl, policy) {
       ".issue-item__article-type",
       ".article__category",
       ".toc__section",
+      ".article__tocHeading",
     ]);
 
     let abstractText = abstractFromMeta || "";
@@ -1353,6 +1477,44 @@ function buildVerificationFailureRecord(inputUrl, policy, errors) {
     },
     verifiedAt: new Date().toISOString(),
     errors,
+  };
+}
+
+function buildExcludedLinkRecord(inputUrl, finalUrl, policy, reason, resolvedTracking) {
+  const maybeDoi = normalizeDoi(finalUrl) || normalizeDoi(inputUrl);
+  return {
+    sourceUrl: inputUrl,
+    finalUrl: finalUrl || inputUrl,
+    title: "[Not verified]",
+    authors: [],
+    year: "[Not verified]",
+    journal: "[Not verified]",
+    volume: "[Not verified]",
+    issue: "[Not verified]",
+    pageRange: "[Not verified]",
+    publishedOnline: "[Not verified]",
+    doiUrl: ensureField(maybeDoi),
+    abstract: "[Not verified]",
+    citation: "[Not verified]",
+    missingFields: ["title", "journal", "year", "abstract", "citation"],
+    status: "excluded",
+    articleTypeRaw: "non-article-link",
+    articleType: "announcement",
+    ingestDecision: "exclude",
+    ingestReason: reason || "non_article_link",
+    policy: {
+      name: policy?.name || "default",
+      protected: Boolean(policy?.protected),
+    },
+    resolvedUrl: finalUrl || inputUrl,
+    tracking: {
+      usedResolution: Boolean(resolvedTracking?.usedTrackingResolution),
+      sourceUrl: resolvedTracking?.inputUrl || inputUrl,
+      resolvedUrl: resolvedTracking?.resolvedUrl || finalUrl || inputUrl,
+      statusCode: resolvedTracking?.trackingStatus || null,
+      error: resolvedTracking?.trackingResolutionError || "",
+    },
+    verifiedAt: new Date().toISOString(),
   };
 }
 
@@ -1425,6 +1587,14 @@ async function verifySingleUrl(getContext, inputUrl, args) {
       const targetUrl = resolved.resolvedUrl;
       const policy = policyForUrl(targetUrl);
       lastPolicy = policy;
+
+      const nonArticleReason = classifyKnownNonArticleLink(targetUrl);
+      if (nonArticleReason) {
+        return {
+          ok: true,
+          record: buildExcludedLinkRecord(inputUrl, targetUrl, policy, nonArticleReason, resolved),
+        };
+      }
 
       const shouldTryScienceDirectCurl =
         args.sciencedirectMode !== "browser" &&
@@ -1582,14 +1752,22 @@ async function initBrowser(args) {
   const { chromium } = playwright;
   if (args.cdpUrl) {
     const browser = await chromium.connectOverCDP(args.cdpUrl);
-    const context = await browser.newContext();
+    const existingContext = browser.contexts()[0] || null;
+    const context = existingContext || (await browser.newContext());
+    const ownsContext = !existingContext;
     return {
       browser,
       context,
       mode: "cdp",
       close: async () => {
-        await context.close();
-        await browser.close();
+        if (ownsContext) {
+          await context.close();
+        }
+        if (typeof browser.disconnect === "function") {
+          await browser.disconnect();
+        } else {
+          await browser.close();
+        }
       },
     };
   }

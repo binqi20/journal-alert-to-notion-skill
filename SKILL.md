@@ -26,6 +26,7 @@ Use these scripts under `scripts/` to standardize the workflow:
 
 1. `scripts/find_gmail_message.py`
    - Finds an exact Gmail message by subject + received minute.
+   - Accepts exact subject matching with trailing punctuation normalization (for example user input omits a terminal period shown in Gmail UI/Atom).
    - Supports optional sender validation (`--sender`) in both Atom and Playwright fallback paths.
    - Uses Atom feed with browser cookies first, then optional Playwright session fallback.
    - Implements a query ladder in Playwright fallback:
@@ -46,12 +47,16 @@ Use these scripts under `scripts/` to standardize the workflow:
      - Python Playwright only when using `--session-fallback` (`uv pip install playwright`)
 2. `scripts/verify_publisher_record.mjs`
    - Verifies metadata from publisher pages with domain policy and challenge detection/retries.
-   - Resolves tracked email links (for example `click.skem1.com`) to final article URLs before verification.
+   - Resolves tracked email links (for example `click.skem1.com`, `el.aom.org`) to final article URLs before verification.
+   - Includes AOM/Atypon (`journals.aom.org`) metadata extraction support using `dc.*` tags + DOM fallbacks (journal breadcrumb, online date, article type).
+   - Strips academic honorifics (for example `Dr.`, `Professor`) before APA author formatting.
+   - Fast-excludes known non-article links (unsubscribe/account/privacy/technology-partner) after tracked-link resolution to avoid unnecessary browser retries.
    - Uses a ScienceDirect-aware strategy (`--sciencedirect-mode auto|curl|browser`, default `auto`):
      - `auto`: curl-first extraction from official ScienceDirect page HTML (including `__PRELOADED_STATE__`) with browser fallback only if metadata is incomplete.
      - `curl`: force ScienceDirect curl path only.
      - `browser`: force browser extraction only.
    - Waits/polls for Cloudflare challenge pages to clear before failing on browser paths.
+   - In `--cdp-url` mode, reuses the existing Chrome profile context (instead of always creating a fresh context) for better challenge/cookie carryover.
    - Emits normalized `articleType`, `ingestDecision`, and `ingestReason` for policy-safe ingestion.
    - Dependency:
      - Node Playwright (`npm i playwright`) or `playwright-core`
@@ -59,6 +64,16 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Normalizes DOI URLs and builds duplicate-safe Notion `create-pages` parameters.
    - Enforces default research/editorial inclusion rules and non-research exclusion by article type.
    - Supports strict duplicate mode with `--require-existing`.
+   - Accepts existing Notion view payload from stdin (`--existing -` or `--existing-stdin`) and can save it locally with `--save-existing` for reproducible duplicate-safe reruns.
+
+### Local Regression Tests (AOM/Atypon Fixtures)
+
+- Redacted AOM/Atypon HTML fixtures live under `tests/fixtures/`.
+- Run parser regression checks with:
+
+```bash
+npm test
+```
 
 Example sequence:
 
@@ -87,6 +102,16 @@ python3 scripts/build_notion_payload.py \
   --require-existing \
   --data-source-id "<collection-id>" \
   --output /tmp/notion_create_payload.json
+
+# Example when piping a raw Notion query-database-view JSON payload:
+# cat /tmp/notion_query_view_raw.json | \
+# python3 scripts/build_notion_payload.py \
+#   --records /tmp/journal_verified_records.json \
+#   --existing-stdin \
+#   --save-existing /tmp/notion_existing_rows.json \
+#   --require-existing \
+#   --data-source-id "<collection-id>" \
+#   --output /tmp/notion_create_payload.json
 ```
 
 ## Default Inclusion Rules
@@ -147,6 +172,7 @@ Use this escalation path; stop at the first reliable method.
   - Confirm navigation is in Gmail search mode (not inbox-like fallback).
   - If query route looks applied but rows are clearly inbox-like, downgrade to next strategy.
 - If timestamp is given, confirm the exact row datetime before opening the conversation.
+- Treat terminal subject punctuation differences as a valid match only when the received minute (and sender, if provided) also matches.
 - Open the exact conversation and extract:
   - Subject
   - Sender
@@ -167,6 +193,7 @@ Use this escalation path; stop at the first reliable method.
 
 - Prefer resilient selectors (`role`, `aria-label`, semantic landmarks) over brittle class names.
 - Wait for stable render (`networkidle` plus explicit content checks).
+- Prefer concrete Gmail surface readiness checks (rows/message header/search input) before `networkidle`; use `networkidle` only as a short fallback because Gmail often keeps background requests alive.
 - If needed, switch between hash-route search and search-input (`Enter`) fallback mode.
 - Persist diagnostics for each attempt:
   - strategy name,
@@ -181,6 +208,7 @@ Use this escalation path; stop at the first reliable method.
 
 - For unprotected domains, HTTP fetch + parser is acceptable.
 - For protected domains (often INFORMS, SAGE, Wiley), default to browser-rendered extraction.
+- For AOM/Atypon (`journals.aom.org`), treat as protected and prefer browser extraction (CDP-attached Chrome when available). The pages often expose `dc.*` metadata that is sufficient for accurate journal/year/article-type extraction once rendered.
 - For ScienceDirect links, default to the script’s curl-first path (`--sciencedirect-mode auto`) and only fall back to browser when required metadata is incomplete.
 - For Oxford Academic (`academic.oup.com`), treat as protected and expect a temporary Cloudflare interstitial.
 
@@ -212,7 +240,7 @@ Recovery sequence:
 
 1. Retry URL with backoff (for example, 2s, 5s, 10s).
 2. Open canonical DOI URL and resolved publisher URL in fresh tab/context.
-3. Attach automation to a normal authenticated Chrome session (CDP) if available.
+3. Attach automation to a normal authenticated Chrome session (CDP) if available; prefer reusing the existing profile/browser context to preserve cookies/challenge state.
 4. Reduce per-domain concurrency to 1.
 5. Wait/poll challenge pages for a bounded window (for example, 30-45s) before marking blocked.
 
@@ -220,9 +248,10 @@ If still blocked, mark missing fields as `[Not verified]` and do not auto-ingest
 
 ### Tracked Link Resolution
 
-- Journal alert emails may use redirect trackers (for example `click.skem1.com`).
+- Journal alert emails may use redirect trackers (for example `click.skem1.com`, `el.aom.org`).
 - Resolve tracked links to final destinations before metadata extraction.
 - Filter to article/DOI destinations and ignore account, privacy, unsubscribe, and global marketing links.
+- If tracked-link resolution lands on known non-article endpoints (for example AOM account/login/privacy/Atypon partner pages), classify as `exclude` immediately and skip expensive metadata extraction.
 
 ### Metadata Extraction Order
 
@@ -275,6 +304,7 @@ If any required field is missing, set `[Not verified]` and skip ingestion.
 - For deduplication, prefer database-view rows/property checks over broad semantic search.
 - Avoid duplicates by checking existing entries for matching DOI URL (exact or normalized).
 - Prefer one database-view pull + local DOI normalization over repeated semantic searches.
+- If `query-database-view` rejects a copied public Notion URL, retry with the `view://...` identifier from `fetch`; as a temporary fallback, run exact DOI searches against the target data source before writing.
 
 ## Notion Rate-Limit Handling
 

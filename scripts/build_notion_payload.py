@@ -46,7 +46,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--existing",
         type=Path,
-        help="Optional JSON file containing existing Notion rows (view query output).",
+        help=(
+            "Optional JSON file containing existing Notion rows (view query output). "
+            "Use '-' to read the existing payload JSON from stdin."
+        ),
+    )
+    parser.add_argument(
+        "--existing-stdin",
+        action="store_true",
+        help="Read existing Notion view payload JSON from stdin (alternative to --existing).",
+    )
+    parser.add_argument(
+        "--save-existing",
+        type=Path,
+        help=(
+            "Optional path to save the parsed existing payload used for duplicate checks. "
+            "Useful when piping query-database-view output into this script."
+        ),
     )
     parser.add_argument(
         "--require-existing",
@@ -158,6 +174,11 @@ def normalize_doi_url(raw_value: Any) -> str:
 
 
 def _read_json(path: Path) -> Any:
+    if str(path) == "-":
+        try:
+            return json.loads(sys.stdin.read())
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid JSON from stdin: {exc}")
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -277,8 +298,12 @@ def _extract_existing_doi_set(existing_payload: Any) -> tuple[set[str], dict[str
 
 
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
-    if args.require_existing and not args.existing:
-        _die("--require-existing was set but --existing was not provided.")
+    if args.existing and args.existing_stdin:
+        _die("Provide only one of --existing or --existing-stdin.")
+
+    has_existing_input = bool(args.existing) or bool(args.existing_stdin)
+    if args.require_existing and not has_existing_input:
+        _die("--require-existing was set but no existing payload input was provided.")
 
     incoming_payload = _read_json(args.records)
     incoming_records = _extract_records(incoming_payload)
@@ -287,8 +312,22 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     existing_dois: set[str] = set()
     existing_map: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
+    existing_payload: Any | None = None
     if args.existing:
         existing_payload = _read_json(args.existing)
+    elif args.existing_stdin:
+        try:
+            existing_payload = json.loads(sys.stdin.read())
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid JSON from stdin for --existing-stdin: {exc}")
+
+    if existing_payload is not None:
+        if args.save_existing:
+            args.save_existing.parent.mkdir(parents=True, exist_ok=True)
+            args.save_existing.write_text(
+                json.dumps(existing_payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         existing_dois, existing_map = _extract_existing_doi_set(existing_payload)
         _log(f"Loaded {len(existing_dois)} existing DOI URLs", enabled=args.verbose)
     else:
@@ -298,6 +337,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         )
         warnings.append(warning)
         print(f"Warning: {warning}", file=sys.stderr)
+        if args.save_existing:
+            warning2 = "--save-existing was ignored because no existing payload input was provided."
+            warnings.append(warning2)
+            print(f"Warning: {warning2}", file=sys.stderr)
 
     include_types = _parse_csv_set(args.include_types)
     exclude_types = _parse_csv_set(args.exclude_types)
@@ -466,6 +509,11 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "dataSourceId": args.data_source_id or None,
+        "existingInputSource": (
+            "stdin"
+            if (args.existing_stdin or (args.existing and str(args.existing) == "-"))
+            else ("file" if args.existing else None)
+        ),
         "stats": {
             "incomingRecords": len(incoming_records),
             "existingDois": len(existing_dois),
