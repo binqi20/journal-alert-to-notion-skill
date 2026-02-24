@@ -25,7 +25,7 @@ Use this workflow to ingest papers from journal alert emails with strict source 
 Use these scripts under `scripts/` to standardize the workflow:
 
 1. `scripts/find_gmail_message.py`
-   - Finds an exact Gmail message by subject + received minute.
+   - Finds an exact Gmail message by subject + received minute, or by subject + received date (`--received-on` date-only mode).
    - Accepts exact subject matching with trailing punctuation normalization (for example user input omits a terminal period shown in Gmail UI/Atom).
    - Supports optional sender validation (`--sender`) in both Atom and Playwright fallback paths.
    - Uses Atom feed with browser cookies first, then optional Playwright session fallback.
@@ -39,10 +39,13 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Supports search-input fallback mode when hash search routes are unreliable.
    - Validates whether Gmail search was actually applied using both URL state and first-page row-content checks (to catch false `#search/...` views showing inbox-like rows).
    - Supports pagination via `--max-pages` and relaxed date fallback via `--date-window-days`.
+   - Supports date-only requests with `--received-on YYYY-MM-DD` (matches any time on that date; still validates subject and optional sender).
    - Uses hardened Gmail `Older` pagination selectors/click fallbacks and emits warnings when page-1 results are likely truncated (for example exactly `--max-rows` rows but no usable `Older` control).
    - Handles Gmail localized timestamp formats (including narrow-space AM/PM strings).
    - Supports cross-domain Google cookie loading (`.google.com`, `mail.google.com`, `accounts.google.com`) and direct cookie injection for fallback.
    - Emits structured diagnostics (`search_ladder`, `attempts`, sampled rows, selected strategy, warnings).
+   - Emits phase progress checkpoints during long Playwright runs (for example candidate row/open/extract phases) to `<output>.partial.json` when `--output` is set.
+   - Adds row-open retries and extraction-phase warnings so a single Gmail thread/render failure does not abort an entire strategy attempt.
    - Filters alert-management links at extraction time (`unsubscribe`, `removeAlert`, manage-alert/preferences anchors) so `links` and `link_details` are safe verification candidates by default.
    - Filters unsupported schemes (for example `mailto:`, `tel:`, `javascript:`) out of verification candidates during extraction.
    - Preserves raw link capture for audit/debugging via `all_links` / `all_link_details`, and records blocked entries in `blocked_links` / `blocked_link_details` (with `reason` labels).
@@ -68,6 +71,7 @@ Use these scripts under `scripts/` to standardize the workflow:
      - `browser`: force browser extraction only.
    - Waits/polls for Cloudflare challenge pages to clear before failing on browser paths.
    - In `--cdp-url` mode, reuses the existing Chrome profile context (instead of always creating a fresh context) for better challenge/cookie carryover.
+   - Automatically retries Wiley challenge-blocked URLs with a fallback ladder when the initial run is headless: headless -> local CDP attach (if available) -> headed Chrome retry (manual challenge-clear window), and records fallback metadata in `fallbackRuns`.
    - Emits normalized `articleType`, `ingestDecision`, and `ingestReason` for policy-safe ingestion.
    - Dependency:
      - Node Playwright (`npm i playwright`) or `playwright-core`
@@ -158,12 +162,13 @@ If item type is unclear after opening the article landing page, classify as `[No
 1. Locate the target Gmail message.
 2. Extract full email body text and all candidate links.
 3. Classify each item using inclusion/exclusion rules.
-4. Verify each included item on its publisher/DOI page.
-5. Build APA 7 citation from verified source fields only.
-6. Fetch Notion database schema and map properties.
-7. Deduplicate against existing DOI URLs.
-8. Create one Notion page per verified, non-duplicate item.
-9. Re-query database and report added/skipped/gaps.
+4. Fetch current Notion rows (or DOI index) and precheck obvious duplicates (exact/normalized DOI) before expensive publisher verification when possible.
+5. Verify each remaining included item on its publisher/DOI page.
+6. Build APA 7 citation from verified source fields only.
+7. Fetch Notion database schema and map properties.
+8. Deduplicate again against existing DOI URLs (final write gate).
+9. Create one Notion page per verified, non-duplicate item.
+10. Re-query database and report added/skipped/gaps.
 
 ## Gmail Access Playbook
 
@@ -183,6 +188,7 @@ Use this escalation path; stop at the first reliable method.
   - Confirm navigation is in Gmail search mode (not inbox-like fallback).
   - If query route looks applied but rows are clearly inbox-like, downgrade to next strategy.
 - If timestamp is given, confirm the exact row datetime before opening the conversation.
+- If only a date is given, use `--received-on` and accept any time on that date while still requiring subject + (optional) sender match.
 - Treat terminal subject punctuation differences as a valid match only when the received minute (and sender, if provided) also matches.
 - Open the exact conversation and extract:
   - Subject
@@ -205,6 +211,7 @@ Use this escalation path; stop at the first reliable method.
 - Prefer resilient selectors (`role`, `aria-label`, semantic landmarks) over brittle class names.
 - Wait for stable render (`networkidle` plus explicit content checks).
 - Prefer concrete Gmail surface readiness checks (rows/message header/search input) before `networkidle`; use `networkidle` only as a short fallback because Gmail often keeps background requests alive.
+- For long-running scans, inspect `<output>.partial.json` to see the latest phase (`candidate_row_match`, `candidate_opened`, `candidate_extracted`) before killing/retrying the run.
 - Validate search state using row-content heuristics (not URL state alone) when Gmail appears to keep inbox-like rows under a `#search/...` URL.
 - Treat `page 1 returned <max_rows> rows but no usable Older control` as a likely pagination truncation warning and downgrade strategy/fallback accordingly.
 - If needed, switch between hash-route search and search-input (`Enter`) fallback mode.
@@ -258,6 +265,7 @@ Recovery sequence:
 3. Attach automation to a normal authenticated Chrome session (CDP) if available; prefer reusing the existing profile/browser context to preserve cookies/challenge state.
 4. Reduce per-domain concurrency to 1.
 5. Wait/poll challenge pages for a bounded window (for example, 30-45s) before marking blocked.
+6. For Wiley challenge failures in headless mode, use the verifier's automatic fallback ladder (headless -> auto-CDP if available -> headed retry).
 
 If still blocked, mark missing fields as `[Not verified]` and do not auto-ingest.
 

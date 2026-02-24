@@ -1680,6 +1680,83 @@ function buildVerificationFailureRecord(inputUrl, policy, errors) {
   };
 }
 
+function isChallengeFailureRecord(record) {
+  if (!record || !Array.isArray(record.errors)) return false;
+  return record.errors.some((err) => {
+    const name = String(err?.errorName || "");
+    const message = String(err?.message || "");
+    return name === "ChallengeError" || /challenge page detected/i.test(message);
+  });
+}
+
+function isLikelyWileyRecord(record) {
+  const candidates = [record?.sourceUrl, record?.finalUrl, record?.doiUrl];
+  return candidates.some((value) => {
+    const text = String(value || "");
+    return /onlinelibrary\.wiley\.com|wiley\.com|10\.1002\//i.test(text);
+  });
+}
+
+function shouldRetryWithWileyFallback(record, args) {
+  if (!args.headless || args.cdpUrl) return false;
+  if (!record || record.status === "verified") return false;
+  return isChallengeFailureRecord(record) && isLikelyWileyRecord(record);
+}
+
+async function detectLocalCdpUrl(verbose) {
+  const endpoints = [
+    "http://127.0.0.1:9222/json/version",
+    "http://localhost:9222/json/version",
+  ];
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint);
+      if (!response.ok) continue;
+      const data = await response.json();
+      const wsUrl = cleanText(data?.webSocketDebuggerUrl || "");
+      if (wsUrl) {
+        log(`Detected local CDP endpoint via ${endpoint}`, verbose);
+        return wsUrl;
+      }
+    } catch {
+      // Ignore and try next endpoint.
+    }
+  }
+  return null;
+}
+
+async function runVerificationPass(urls, args, seenFinalUrls = new Set()) {
+  let browserState = null;
+  let browserInitPromise = null;
+  const getContext = async () => {
+    if (browserState) return browserState.context;
+    if (!browserInitPromise) {
+      browserInitPromise = initBrowser(args).then((state) => {
+        browserState = state;
+        return state;
+      });
+    }
+    const initialized = await browserInitPromise;
+    return initialized.context;
+  };
+
+  let results = [];
+  try {
+    results = await mapLimit(urls, args.concurrency, async (url) => {
+      return verifySingleUrl(getContext, url, args, seenFinalUrls);
+    });
+  } finally {
+    if (browserState) {
+      await browserState.close();
+    }
+  }
+
+  return {
+    results,
+    mode: browserState?.mode || "curl_only",
+  };
+}
+
 function buildExcludedLinkRecord(inputUrl, finalUrl, policy, reason, resolvedTracking) {
   const maybeDoi = normalizeDoi(finalUrl) || normalizeDoi(inputUrl);
   return {
@@ -2096,41 +2173,69 @@ async function main() {
 
   log(`Loaded ${urls.length} URL(s).`, args.verbose);
 
-  let browserState = null;
-  let browserInitPromise = null;
-  const getContext = async () => {
-    if (browserState) return browserState.context;
-    if (!browserInitPromise) {
-      browserInitPromise = initBrowser(args).then((state) => {
-        browserState = state;
-        return state;
-      });
-    }
-    const initialized = await browserInitPromise;
-    return initialized.context;
-  };
-
-  let results = [];
   const seenFinalUrls = new Set();
-  try {
-    results = await mapLimit(urls, args.concurrency, async (url) => {
-      return verifySingleUrl(getContext, url, args, seenFinalUrls);
-    });
-  } finally {
-    if (browserState) {
-      await browserState.close();
+  const fallbackRuns = [];
+  const initialPass = await runVerificationPass(urls, args, seenFinalUrls);
+  let results = initialPass.results;
+  let mode = initialPass.mode;
+
+  const initialRecords = results.map((item) => item.record);
+  const retrySourceUrls = uniqueStrings(
+    initialRecords.filter((record) => shouldRetryWithWileyFallback(record, args)).map((record) => record.sourceUrl)
+  );
+  if (retrySourceUrls.length > 0) {
+    let fallbackArgs = null;
+    let fallbackKind = "";
+    const autoCdpUrl = await detectLocalCdpUrl(args.verbose);
+    if (autoCdpUrl) {
+      fallbackArgs = {
+        ...args,
+        cdpUrl: autoCdpUrl,
+        headless: false,
+        concurrency: 1,
+      };
+      fallbackKind = "wiley_challenge_auto_cdp";
+    } else {
+      fallbackArgs = {
+        ...args,
+        headless: false,
+        concurrency: 1,
+        challengeWaitMs: Math.max(args.challengeWaitMs, 60_000),
+      };
+      fallbackKind = "wiley_challenge_headed_retry";
     }
+    log(
+      `Retrying ${retrySourceUrls.length} Wiley challenge-blocked URL(s) with fallback: ${fallbackKind}`,
+      args.verbose
+    );
+    const fallbackPass = await runVerificationPass(retrySourceUrls, fallbackArgs, seenFinalUrls);
+    fallbackRuns.push({
+      type: fallbackKind,
+      mode: fallbackPass.mode,
+      urlCount: retrySourceUrls.length,
+      urls: retrySourceUrls,
+    });
+    const replacementBySource = new Map(
+      fallbackPass.results.map((item) => [String(item?.record?.sourceUrl || ""), item])
+    );
+    results = results.map((item) => {
+      const key = String(item?.record?.sourceUrl || "");
+      const replacement = replacementBySource.get(key);
+      return replacement || item;
+    });
+    mode = `${mode}+${fallbackPass.mode}`;
   }
 
   const records = results.map((item) => item.record);
   const output = {
     generatedAt: new Date().toISOString(),
-    mode: browserState?.mode || "curl_only",
+    mode,
     inputCount: urls.length,
     verifiedCount: records.filter((r) => r.status === "verified").length,
     notVerifiedCount: records.filter((r) => r.status !== "verified").length,
     includableCount: records.filter((r) => r.ingestDecision === "include").length,
     excludedCount: records.filter((r) => r.ingestDecision === "exclude").length,
+    fallbackRuns,
     records,
   };
 

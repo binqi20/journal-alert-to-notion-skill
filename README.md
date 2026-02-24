@@ -10,6 +10,13 @@
 - DOI normalization + duplicate-safe Notion payload planning.
 - Structured diagnostics for reproducible runs (`search_ladder`, `attempts`, warnings).
 
+## Recent Improvements (unreleased / post-v0.1.4)
+
+- `find_gmail_message.py` now supports date-only matching via `--received-on YYYY-MM-DD` (subject + sender validation still applies).
+- Gmail Playwright fallback now emits phase checkpoints to `<output>.partial.json` during long runs and adds row-open retries/extraction warnings so one Gmail thread failure does not abort a strategy.
+- `verify_publisher_record.mjs` adds an automatic Wiley challenge fallback ladder for headless runs: headless -> local CDP attach (if available) -> headed retry (manual challenge-clear window), reported in `fallbackRuns`.
+- Workflow guidance now recommends duplicate prechecks (exact/normalized DOI) before expensive publisher verification when possible, then a final dedupe gate before Notion writes.
+
 ## Recent Improvements (v0.1.3)
 
 - Added explicit safety guards to block `unsubscribe`, `removeAlert`, and manage-alert/preferences links before verification browser navigation (including tracker links when Gmail anchor text is available).
@@ -79,8 +86,16 @@ python3 scripts/find_gmail_message.py \
   --date-window-days 1 \
   --output /tmp/journal_email_match.json
 
+# Date-only mode (accept any time on the date):
+# python3 scripts/find_gmail_message.py \
+#   --subject "Early View Alert: Strategic Management Journal" \
+#   --sender "WileyOnlineLibrary@wiley.com" \
+#   --received-on "2026-02-08" \
+#   --session-fallback --inject-browser-cookies \
+#   --output /tmp/journal_email_match.json
+
 node scripts/verify_publisher_record.mjs \
-  --input /tmp/journal_email_links.json \
+  --input /tmp/journal_email_match.json \
   --sciencedirect-mode auto \
   --output /tmp/journal_verified_records.json
 
@@ -102,6 +117,11 @@ python3 scripts/build_notion_payload.py \
 #   --output /tmp/notion_create_payload.json
 ```
 
+Recommended order for large alerts:
+- Precheck obvious duplicates (exact/normalized DOI) from existing Notion rows first.
+- Run publisher verification only for remaining candidates.
+- Run `build_notion_payload.py` with `--require-existing` as the final duplicate-safe write gate.
+
 ## Testing
 
 Run local parser regression tests (AOM/Atypon fixtures):
@@ -118,8 +138,12 @@ These tests validate recent parser improvements, including AOM journal inference
   Gmail may display/store a subject with a trailing period while the copied subject omits it. The Gmail helper now normalizes trailing punctuation, but keep the received timestamp for exact targeting.
 - Gmail search appears to stay in Inbox:
   The helper already validates search-state and downgrades strategy when Gmail silently fails a query route. Review `attempts` diagnostics in the JSON output.
+- Gmail helper looks stalled during a long Playwright run:
+  If `--output` is set, inspect `<output>.partial.json` to see the latest phase (`candidate_row_match`, `candidate_opened`, `candidate_extracted`) and current strategy.
 - Protected publisher pages (Cloudflare / anti-bot):
   Prefer running with a normal authenticated Chrome session and attach via `--cdp-url` when verification is blocked.
+- Wiley / SMJ challenge in headless verification:
+  The verifier now auto-retries Wiley challenge failures with a local CDP browser if available, otherwise a headed Chrome retry; inspect `fallbackRuns` in output JSON for the path used.
 - ScienceDirect verification challenge:
   Use the default `--sciencedirect-mode auto`; it prefers a fast curl path and falls back to browser only if required fields are incomplete.
 

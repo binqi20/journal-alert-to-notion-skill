@@ -53,13 +53,20 @@ def parse_args() -> argparse.Namespace:
             "Examples: alerts@journal.com or 'Journal Alerts'."
         ),
     )
-    parser.add_argument(
+    received_group = parser.add_mutually_exclusive_group(required=True)
+    received_group.add_argument(
         "--received-at",
-        required=True,
         help=(
             "Target received datetime. Examples: "
             "'2026-01-19 17:18', '2026-01-19T17:18:00-05:00', "
             "'Jan 19, 2026, 5:18 PM'."
+        ),
+    )
+    received_group.add_argument(
+        "--received-on",
+        help=(
+            "Target received date (date-only mode). Examples: '2026-02-08', "
+            "'Feb 8, 2026'. Matches any time on that date."
         ),
     )
     parser.add_argument(
@@ -215,6 +222,32 @@ def _parse_received_datetime(raw: str, fallback_tz: dt.tzinfo) -> dt.datetime:
     raise AssertionError("unreachable")
 
 
+def _parse_received_date(raw: str) -> dt.date:
+    value = raw.strip()
+    fmt_candidates = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%a, %b %d, %Y",
+        "%A, %b %d, %Y",
+        "%a, %B %d, %Y",
+        "%A, %B %d, %Y",
+    ]
+    for fmt in fmt_candidates:
+        try:
+            return dt.datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.date()
+    except ValueError:
+        pass
+    _die("Could not parse --received-on. Use ISO date like '2026-02-08'.")
+    raise AssertionError("unreachable")
+
+
 def _same_minute(a: dt.datetime, b: dt.datetime, tz: dt.tzinfo) -> bool:
     aa = a.astimezone(tz)
     bb = b.astimezone(tz)
@@ -225,6 +258,10 @@ def _same_minute(a: dt.datetime, b: dt.datetime, tz: dt.tzinfo) -> bool:
         and aa.hour == bb.hour
         and aa.minute == bb.minute
     )
+
+
+def _same_local_date(a: dt.datetime, target_date: dt.date, tz: dt.tzinfo) -> bool:
+    return a.astimezone(tz).date() == target_date
 
 
 def _normalized_sender_text(value: str | None) -> str:
@@ -668,6 +705,8 @@ def _select_atom_match(
     target_dt: dt.datetime,
     tz: dt.tzinfo,
     sender: str | None,
+    target_date: dt.date,
+    date_only_mode: bool,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     for entry in entries:
@@ -680,16 +719,20 @@ def _select_atom_match(
         if issued_dt is not None:
             candidate["issued_local"] = issued_dt.astimezone(tz).isoformat()
             candidate["minute_match"] = _same_minute(issued_dt, target_dt, tz)
+            candidate["date_match"] = _same_local_date(issued_dt, target_date, tz)
         else:
             candidate["issued_local"] = None
             candidate["minute_match"] = False
+            candidate["date_match"] = False
         candidate["sender_match"] = _sender_matches(
             sender,
             str(candidate.get("author_name") or ""),
             str(candidate.get("author_email") or ""),
         )
         candidates.append(candidate)
-        if candidate["minute_match"] and candidate["sender_match"]:
+        if (candidate["date_match"] if date_only_mode else candidate["minute_match"]) and candidate[
+            "sender_match"
+        ]:
             return candidate, candidates
     return None, candidates
 
@@ -742,6 +785,22 @@ def _safe_attr(locator: Any, attr: str) -> str:
     except Exception:
         return ""
     return (value or "").strip()
+
+
+def _safe_link_details(page: Any) -> list[dict[str, str]]:
+    details: list[dict[str, str]] = []
+    try:
+        links = page.locator("div.a3s a[href]")
+        count = min(links.count(), 500)
+    except Exception:
+        return details
+    for idx in range(count):
+        node = links.nth(idx)
+        href = _safe_attr(node, "href")
+        if not href:
+            continue
+        details.append({"href": href, "text": _safe_inner_text(node)})
+    return details
 
 
 def _wait_for_gmail_surface(page: Any, *, verbose: bool, phase: str) -> None:
@@ -977,9 +1036,11 @@ def _extract_message_candidate(
     row_sender: str,
     row_time_hint: str,
     target_dt: dt.datetime,
+    target_date: dt.date,
     sender: str | None,
     tz: dt.tzinfo,
     include_body: bool,
+    date_only_mode: bool,
 ) -> dict[str, Any]:
     message_subject = _safe_inner_text(page.locator("h2.hP").first) or row_subject
     sender_chip = page.locator("span.gD").first
@@ -1008,17 +1069,7 @@ def _extract_message_candidate(
         if row_parsed is not None:
             parsed_datetimes.append(row_parsed)
 
-    try:
-        link_details = page.locator("div.a3s a[href]").evaluate_all(
-            """nodes => nodes
-                .map(n => ({
-                    href: n.href || "",
-                    text: (n.textContent || "").replace(/\\s+/g, " ").trim()
-                }))
-                .filter(item => item.href)"""
-        )
-    except Exception:
-        link_details = []
+    link_details = _safe_link_details(page)
     all_link_details = link_details
     all_links = [str(item.get("href") or "").strip() for item in all_link_details if isinstance(item, dict)] or []
     if not all_links and all_link_details:
@@ -1050,6 +1101,7 @@ def _extract_message_candidate(
         body_text = _safe_inner_text(page.locator("div.a3s").first)
 
     minute_match = any(_same_minute(value, target_dt, tz) for value in parsed_datetimes)
+    date_match = any(_same_local_date(value, target_date, tz) for value in parsed_datetimes)
     sender_match = _sender_matches(sender, sender_name, sender_email)
     candidate: dict[str, Any] = {
         "strategy": strategy_name,
@@ -1061,6 +1113,7 @@ def _extract_message_candidate(
         "timestamps": timestamps,
         "timestamps_local": [x.astimezone(tz).isoformat() for x in parsed_datetimes],
         "minute_match": minute_match,
+        "date_match": date_match,
         "url": page.url,
         "links": links,
         "link_details": safe_link_details,
@@ -1071,6 +1124,7 @@ def _extract_message_candidate(
     }
     if include_body:
         candidate["body_text"] = body_text
+    candidate["time_match_mode"] = "date" if date_only_mode else "minute"
     return candidate
 
 
@@ -1080,12 +1134,15 @@ def _scan_current_view(
     strategy_name: str,
     subject: str,
     target_dt: dt.datetime,
+    target_date: dt.date,
     sender: str | None,
     tz: dt.tzinfo,
     max_rows: int,
     max_pages: int,
     include_body: bool,
     verbose: bool,
+    date_only_mode: bool,
+    progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     sample_rows: list[dict[str, Any]] = []
@@ -1135,27 +1192,90 @@ def _scan_current_view(
             if not exact_probe_hit:
                 continue
 
-            try:
-                row.click(timeout=15000)
-            except Exception:
-                continue
-            page.wait_for_timeout(1100)
+            row_ctx = {
+                "page": page_index,
+                "row": row_index + 1,
+                "row_subject": row_subject,
+                "row_sender": row_sender,
+                "row_time_hint": row_time_hint,
+            }
+            if progress_callback is not None:
+                progress_callback("candidate_row_match", row_ctx)
 
-            candidate = _extract_message_candidate(
-                page=page,
-                strategy_name=strategy_name,
-                row_subject=row_subject,
-                row_sender=row_sender,
-                row_time_hint=row_time_hint,
-                target_dt=target_dt,
-                sender=sender,
-                tz=tz,
-                include_body=include_body,
+            opened = False
+            open_error = ""
+            for open_attempt in range(1, 3):
+                try:
+                    _log(
+                        f"[{strategy_name}] opening candidate row p{page_index} r{row_index+1} (attempt {open_attempt}/2)",
+                        enabled=verbose,
+                    )
+                    row.click(timeout=12000)
+                    page.wait_for_timeout(700)
+                    try:
+                        page.wait_for_selector("h2.hP, div.a3s", state="attached", timeout=6000)
+                    except Exception:
+                        _wait_for_gmail_surface(page, verbose=verbose, phase="thread open")
+                    opened = True
+                    if progress_callback is not None:
+                        progress_callback("candidate_opened", {**row_ctx, "open_attempt": open_attempt})
+                    break
+                except Exception as exc:
+                    open_error = str(exc)
+                    _log(
+                        f"[{strategy_name}] failed to open candidate row p{page_index} r{row_index+1} (attempt {open_attempt}/2): {exc}",
+                        enabled=verbose,
+                    )
+                    page.wait_for_timeout(500)
+            if not opened:
+                warnings.append(
+                    f"{strategy_name}: could not open row p{page_index} r{row_index+1} ({open_error or 'unknown error'})."
+                )
+                continue
+
+            _log(
+                f"[{strategy_name}] extracting message details p{page_index} r{row_index+1}",
+                enabled=verbose,
             )
+            try:
+                candidate = _extract_message_candidate(
+                    page=page,
+                    strategy_name=strategy_name,
+                    row_subject=row_subject,
+                    row_sender=row_sender,
+                    row_time_hint=row_time_hint,
+                    target_dt=target_dt,
+                    target_date=target_date,
+                    sender=sender,
+                    tz=tz,
+                    include_body=include_body,
+                    date_only_mode=date_only_mode,
+                )
+            except Exception as exc:
+                warnings.append(
+                    f"{strategy_name}: failed to extract message details for row p{page_index} r{row_index+1} ({exc})."
+                )
+                _log(
+                    f"[{strategy_name}] extraction error p{page_index} r{row_index+1}: {exc}",
+                    enabled=verbose,
+                )
+                _return_to_list(page, verbose=verbose)
+                continue
             candidates.append(candidate)
+            if progress_callback is not None:
+                progress_callback(
+                    "candidate_extracted",
+                    {
+                        **row_ctx,
+                        "candidate_subject": candidate.get("subject"),
+                        "minute_match": bool(candidate.get("minute_match")),
+                        "date_match": bool(candidate.get("date_match")),
+                        "sender_match": bool(candidate.get("sender_match")),
+                    },
+                )
             match_hit = (
                 _subject_matches_requested(str(candidate.get("subject") or ""), subject)
-                and bool(candidate.get("minute_match"))
+                and bool(candidate.get("date_match") if date_only_mode else candidate.get("minute_match"))
                 and bool(candidate.get("sender_match"))
             )
             _return_to_list(page, verbose=verbose)
@@ -1225,6 +1345,8 @@ def _playwright_lookup(
     *,
     subject: str,
     target_dt: dt.datetime,
+    target_date: dt.date,
+    date_only_mode: bool,
     sender: str | None,
     tz: dt.tzinfo,
     mailbox: str,
@@ -1240,6 +1362,7 @@ def _playwright_lookup(
     date_window_days: int,
     include_body: bool,
     verbose: bool,
+    checkpoint_path: Path | None = None,
 ) -> dict[str, Any]:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
@@ -1259,6 +1382,34 @@ def _playwright_lookup(
     attempts: list[dict[str, Any]] = []
     all_candidates: list[dict[str, Any]] = []
     fallback_warnings: list[str] = []
+
+    def emit_checkpoint(phase: str, extra: dict[str, Any] | None = None) -> None:
+        if checkpoint_path is None:
+            return
+        checkpoint_payload: dict[str, Any] = {
+            "partial": True,
+            "phase": phase,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "found": False,
+            "subject": subject,
+            "sender_filter": sender or None,
+            "target_received_at_local": target_dt.astimezone(tz).isoformat(),
+            "target_received_on_local": str(target_date),
+            "time_match_mode": "date" if date_only_mode else "minute",
+            "attempts": attempts,
+            "candidate_count": len(all_candidates),
+            "warnings": fallback_warnings,
+        }
+        if extra:
+            checkpoint_payload.update(extra)
+        try:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_path.write_text(
+                json.dumps(checkpoint_payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     with sync_playwright() as playwright:
         browser_instance = None
@@ -1334,6 +1485,7 @@ def _playwright_lookup(
                     "error": None,
                 }
                 attempts.append(attempt)
+                emit_checkpoint("attempt_start", {"current_attempt": attempt.get("name")})
 
                 try:
                     nav = _goto_mail_view(
@@ -1351,6 +1503,10 @@ def _playwright_lookup(
                         attempt["inbox_like"] = bool(nav.get("inbox_like"))
                         if not attempt["search_applied"] or attempt["inbox_like"]:
                             attempt["final_url"] = page.url
+                            emit_checkpoint(
+                                "attempt_search_not_applied",
+                                {"current_attempt": attempt.get("name"), "current_url": page.url},
+                            )
                             continue
 
                     scan = _scan_current_view(
@@ -1358,12 +1514,18 @@ def _playwright_lookup(
                         strategy_name=str(strategy.get("name") or ""),
                         subject=subject,
                         target_dt=target_dt,
+                        target_date=target_date,
                         sender=sender,
                         tz=tz,
                         max_rows=max_rows,
                         max_pages=max_pages,
                         include_body=include_body,
                         verbose=verbose,
+                        date_only_mode=date_only_mode,
+                        progress_callback=lambda phase, info, _attempt=attempt: emit_checkpoint(
+                            phase,
+                            {"current_attempt": _attempt.get("name"), "progress": info},
+                        ),
                     )
                     attempt["pages_scanned"] = scan.get("pages_scanned", 0)
                     attempt["rows_scanned"] = scan.get("rows_scanned", 0)
@@ -1391,12 +1553,33 @@ def _playwright_lookup(
                         )
                         if mismatch_warning not in fallback_warnings:
                             fallback_warnings.append(mismatch_warning)
+                        emit_checkpoint(
+                            "attempt_content_mismatch",
+                            {"current_attempt": attempt.get("name"), "search_row_probe": probe},
+                        )
                         continue
 
                     all_candidates.extend(scan.get("candidates", []))
+                    emit_checkpoint(
+                        "attempt_scan_complete",
+                        {
+                            "current_attempt": attempt.get("name"),
+                            "scan_found": bool(scan.get("found")),
+                            "candidate_count": len(all_candidates),
+                        },
+                    )
                     if scan.get("found"):
                         attempt["found"] = True
                         deduped = _dedupe_candidates(all_candidates)
+                        emit_checkpoint(
+                            "match_found",
+                            {
+                                "found": True,
+                                "strategy": strategy.get("name"),
+                                "match": scan.get("match"),
+                                "candidate_count": len(deduped),
+                            },
+                        )
                         return {
                             "found": True,
                             "match": scan.get("match"),
@@ -1408,8 +1591,13 @@ def _playwright_lookup(
                 except Exception as exc:
                     attempt["error"] = str(exc)
                     attempt["final_url"] = page.url
+                    emit_checkpoint(
+                        "attempt_error",
+                        {"current_attempt": attempt.get("name"), "error": str(exc), "current_url": page.url},
+                    )
 
             deduped = _dedupe_candidates(all_candidates)
+            emit_checkpoint("playwright_complete", {"candidate_count": len(deduped)})
             return {
                 "found": False,
                 "match": None,
@@ -1432,6 +1620,12 @@ def _write_json_output(payload: dict[str, Any], output_path: Path | None) -> Non
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(serialized + "\n", encoding="utf-8")
+        partial_path = output_path.with_suffix(output_path.suffix + ".partial.json")
+        try:
+            if partial_path.exists():
+                partial_path.unlink()
+        except Exception:
+            pass
 
 
 def _is_cert_verify_error(exc: Exception) -> bool:
@@ -1442,7 +1636,13 @@ def _is_cert_verify_error(exc: Exception) -> bool:
 def main() -> None:
     args = parse_args()
     tz = _timezone_from_args(args.timezone)
-    target_dt = _parse_received_datetime(args.received_at, tz)
+    date_only_mode = bool(args.received_on and not args.received_at)
+    if date_only_mode:
+        target_date = _parse_received_date(str(args.received_on))
+        target_dt = dt.datetime.combine(target_date, dt.time(12, 0), tzinfo=tz)
+    else:
+        target_dt = _parse_received_datetime(str(args.received_at), tz)
+        target_date = target_dt.astimezone(tz).date()
     ladder_preview = _build_search_ladder(
         subject=args.subject,
         target_dt=target_dt,
@@ -1461,6 +1661,8 @@ def main() -> None:
         "subject": args.subject,
         "sender_filter": args.sender or None,
         "target_received_at_local": target_dt.astimezone(tz).isoformat(),
+        "target_received_on_local": str(target_date),
+        "time_match_mode": "date" if date_only_mode else "minute",
         "search_query": search_query,
         "search_ladder": ladder_preview,
         "match": None,
@@ -1512,7 +1714,15 @@ def main() -> None:
                     raise
 
             entries = _parse_atom_entries(atom_xml)
-            match, candidates = _select_atom_match(entries, args.subject, target_dt, tz, args.sender)
+            match, candidates = _select_atom_match(
+                entries,
+                args.subject,
+                target_dt,
+                tz,
+                args.sender,
+                target_date,
+                date_only_mode,
+            )
             payload["candidates"] = candidates
             payload["atom"] = {
                 "attempted": True,
@@ -1523,7 +1733,9 @@ def main() -> None:
             if match is not None:
                 payload["found"] = True
                 payload["method"] = "atom_feed"
-                payload["strategy"] = "atom_feed_exact_subject_minute"
+                payload["strategy"] = (
+                    "atom_feed_exact_subject_date" if date_only_mode else "atom_feed_exact_subject_minute"
+                )
                 payload["match"] = match
                 _write_json_output(payload, args.output)
                 return
@@ -1543,6 +1755,8 @@ def main() -> None:
             fallback = _playwright_lookup(
                 subject=args.subject,
                 target_dt=target_dt,
+                target_date=target_date,
+                date_only_mode=date_only_mode,
                 sender=args.sender,
                 tz=tz,
                 mailbox=args.mailbox,
@@ -1558,6 +1772,9 @@ def main() -> None:
                 date_window_days=args.date_window_days,
                 include_body=args.include_body,
                 verbose=args.verbose,
+                checkpoint_path=(
+                    args.output.with_suffix(args.output.suffix + ".partial.json") if args.output else None
+                ),
             )
             atom_candidates = payload.get("candidates", [])
             fallback_candidates = fallback.get("candidates", [])

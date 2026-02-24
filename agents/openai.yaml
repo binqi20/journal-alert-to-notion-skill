@@ -1,4 +1,4 @@
 interface:
   display_name: "Journal Alert to Notion"
   short_description: "Ingest verified Gmail journal alert papers to Notion with anti-bot-aware extraction."
-  default_prompt: "Use $journal-alert-to-notion to process a Gmail journal alert using the exact email subject and received timestamp, verify research articles/editorials on official publisher pages (including anti-bot protected pages), deduplicate by canonical DOI against my target Notion database, and add accurate entries. Report added items, skipped items with reasons, and any verification gaps."
+  default_prompt: "Use $journal-alert-to-notion to process a Gmail journal alert using the exact email subject and received timestamp (or date-only if that is all I provide), extract only safe candidate links (never unsubscribe/manage-alert URLs), precheck canonical DOI duplicates against my target Notion database before expensive verification when possible, verify research articles/editorials on official publisher pages (including anti-bot protected pages), and add only verified non-duplicate entries. Report added items, skipped items with reasons, duplicate hits, and any verification gaps."
