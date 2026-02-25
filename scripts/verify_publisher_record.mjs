@@ -671,10 +671,26 @@ function stripAcademicHonorifics(name) {
 function formatApaAuthor(name) {
   const cleaned = stripAcademicHonorifics(name);
   if (!cleaned) return "";
-  const parts = cleaned.split(/\s+/).filter(Boolean);
-  if (parts.length === 1) return parts[0];
-  const surname = parts.at(-1);
-  const given = parts.slice(0, -1);
+  let surname = "";
+  let given = [];
+  const commaIdx = cleaned.indexOf(",");
+  if (commaIdx >= 0) {
+    surname = cleanText(cleaned.slice(0, commaIdx));
+    const givenPart = cleanText(cleaned.slice(commaIdx + 1));
+    given = givenPart.split(/\s+/).filter(Boolean);
+  } else {
+    const parts = cleaned.split(/\s+/).filter(Boolean);
+    if (parts.length === 1) return parts[0];
+    surname = parts.at(-1) || "";
+    given = parts.slice(0, -1);
+  }
+  if (!surname) {
+    const fallbackParts = cleaned.split(/\s+/).filter(Boolean);
+    if (!fallbackParts.length) return "";
+    if (fallbackParts.length === 1) return fallbackParts[0];
+    surname = fallbackParts.at(-1) || "";
+    given = fallbackParts.slice(0, -1);
+  }
   const initials = given
     .map((part) => part.replace(/[^A-Za-z-]/g, ""))
     .filter(Boolean)

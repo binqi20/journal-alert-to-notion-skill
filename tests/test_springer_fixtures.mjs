@@ -56,6 +56,8 @@ test("Springer fixture parser extracts raw article type and DOI", async () => {
   assert.equal(record.articleTypeRaw, "Original Paper");
   assert.equal(record.doiUrl, "https://doi.org/10.1007/s10551-025-05968-0");
   assert.ok(record.abstract && record.abstract.length > 80);
+  assert.match(record.citation, /^Wang, [A-Z]\. [A-Z]\.,/);
+  assert.ok(!record.citation.startsWith("Sophie, W."));
 });
 
 test("Springer Original Paper raw type outranks title heuristic containing Perspective", () => {
