@@ -163,6 +163,62 @@ const POLICY_ARTICLE_TYPE_OVERRIDES = {
   ],
 };
 
+const POLICY_AUTHOR_PARSING_HINTS = {
+  springer_link: {
+    preferCommaSurnameFirst: true,
+    authorSourcePriority: ["meta", "dom", "jsonld_name"],
+  },
+  wiley: {
+    authorSourcePriority: ["meta", "dom", "jsonld_name"],
+  },
+  aom_atypon: {
+    authorSourcePriority: ["meta", "dom"],
+  },
+  sciencedirect: {
+    authorSourcePriority: ["preloaded_structured", "meta", "jsonld_person", "dom"],
+  },
+};
+
+const AUTHOR_FAMILY_PARTICLES = new Set([
+  "da",
+  "de",
+  "del",
+  "della",
+  "der",
+  "di",
+  "du",
+  "la",
+  "le",
+  "van",
+  "von",
+  "bin",
+  "ibn",
+  "al",
+  "el",
+  "st.",
+  "st",
+]);
+
+const CORPORATE_AUTHOR_TERMS = [
+  /\bassociation\b/i,
+  /\bcommittee\b/i,
+  /\bconsortium\b/i,
+  /\buniversity\b/i,
+  /\bcenter\b/i,
+  /\bcentre\b/i,
+  /\binstitute\b/i,
+  /\borganization\b/i,
+  /\bgroup\b/i,
+  /\bcorporation\b/i,
+  /\bcorp\.?\b/i,
+  /\binc\.?\b/i,
+  /\bltd\.?\b/i,
+  /\bllc\b/i,
+  /\bplc\b/i,
+];
+
+const AUTHOR_SUFFIX_RE = /^(jr|sr|ii|iii|iv|v)\.?$/i;
+
 function usage() {
   const script = path.basename(process.argv[1] || "verify_publisher_record.mjs");
   console.error(`Usage:
@@ -668,51 +724,234 @@ function stripAcademicHonorifics(name) {
     .trim();
 }
 
-function formatApaAuthor(name) {
-  const cleaned = stripAcademicHonorifics(name);
-  if (!cleaned) return "";
-  let surname = "";
-  let given = [];
-  const commaIdx = cleaned.indexOf(",");
-  if (commaIdx >= 0) {
-    surname = cleanText(cleaned.slice(0, commaIdx));
-    const givenPart = cleanText(cleaned.slice(commaIdx + 1));
-    given = givenPart.split(/\s+/).filter(Boolean);
-  } else {
-    const parts = cleaned.split(/\s+/).filter(Boolean);
-    if (parts.length === 1) return parts[0];
-    surname = parts.at(-1) || "";
-    given = parts.slice(0, -1);
+function policyAuthorParsingHints(policyName) {
+  return POLICY_AUTHOR_PARSING_HINTS[String(policyName || "").trim()] || {};
+}
+
+function normalizeAuthorToken(token) {
+  return cleanText(String(token || "").replace(/^[,;]+|[,;]+$/g, ""));
+}
+
+function looksCorporateAuthorName(name) {
+  const cleaned = cleanText(name);
+  if (!cleaned) return false;
+  return CORPORATE_AUTHOR_TERMS.some((pattern) => pattern.test(cleaned));
+}
+
+function splitGivenTokens(raw) {
+  return cleanText(raw)
+    .split(/\s+/)
+    .map((token) => normalizeAuthorToken(token))
+    .filter(Boolean);
+}
+
+function extractAuthorSuffix(tokens) {
+  if (!Array.isArray(tokens) || !tokens.length) {
+    return { tokens: [], suffix: "", hadUnsupportedSuffix: false };
   }
-  if (!surname) {
-    const fallbackParts = cleaned.split(/\s+/).filter(Boolean);
-    if (!fallbackParts.length) return "";
-    if (fallbackParts.length === 1) return fallbackParts[0];
-    surname = fallbackParts.at(-1) || "";
-    given = fallbackParts.slice(0, -1);
+  const items = [...tokens];
+  const last = normalizeAuthorToken(items.at(-1));
+  if (!last) {
+    items.pop();
+    return { tokens: items, suffix: "", hadUnsupportedSuffix: false };
   }
-  const initials = given
-    .map((part) => part.replace(/[^A-Za-z-]/g, ""))
+  if (AUTHOR_SUFFIX_RE.test(last)) {
+    items.pop();
+    return {
+      tokens: items,
+      suffix: last.replace(/\.$/, "").replace(/^([a-z])/i, (m) => m.toUpperCase()),
+      hadUnsupportedSuffix: false,
+    };
+  }
+  return { tokens: items, suffix: "", hadUnsupportedSuffix: false };
+}
+
+function buildAuthorInitials(givenTokens) {
+  return (givenTokens || [])
+    .map((part) => String(part || "").trim())
     .filter(Boolean)
     .map((part) => {
-      if (part.includes("-")) {
-        return part
+      const cleaned = part.replace(/[^A-Za-z'-]/g, "");
+      if (!cleaned) return "";
+      if (cleaned.includes("-")) {
+        return cleaned
           .split("-")
           .filter(Boolean)
           .map((seg) => `${seg[0].toUpperCase()}.`)
           .join("-");
       }
-      return `${part[0].toUpperCase()}.`;
+      return `${cleaned[0].toUpperCase()}.`;
     })
+    .filter(Boolean)
     .join(" ");
-  return initials ? `${surname}, ${initials}` : surname;
 }
 
-function formatApaAuthors(authors) {
+function normalizeStructuredAuthorCandidate(candidate, options = {}) {
+  if (!candidate || typeof candidate !== "object") return null;
+  const raw = stripAcademicHonorifics(candidate.raw || "");
+  const family = cleanText(candidate.family);
+  const givenRaw = Array.isArray(candidate.given)
+    ? candidate.given.map((token) => normalizeAuthorToken(token)).filter(Boolean)
+    : splitGivenTokens(candidate.given || "");
+  const suffix = cleanText(candidate.suffix);
+  const parseMode = cleanText(candidate.parseMode) || "structured";
+  const source = cleanText(candidate.source || options.source || "");
+  const confidence = cleanText(candidate.confidence) || "high";
+  if (!family && !givenRaw.length && !raw) return null;
+  const normalized = {
+    raw: raw || cleanText([family, ...givenRaw].join(" ")),
+    family,
+    given: givenRaw,
+    suffix,
+    formattedApa: "",
+    parseMode,
+    source,
+    confidence,
+  };
+  normalized.formattedApa = formatApaAuthorFromStructured(normalized);
+  return normalized;
+}
+
+function parseAuthorName(rawName, options = {}) {
+  const warnings = [];
+  const raw = stripAcademicHonorifics(rawName || "");
+  if (!raw) return { author: null, warnings };
+
+  if (looksCorporateAuthorName(raw)) {
+    const author = {
+      raw,
+      family: "",
+      given: [],
+      suffix: "",
+      formattedApa: raw,
+      parseMode: "corporate",
+      source: cleanText(options.source || ""),
+      confidence: "medium",
+    };
+    return { author, warnings };
+  }
+
+  const preferCommaSurnameFirst = Boolean(options.preferCommaSurnameFirst);
+  const commaIdx = raw.indexOf(",");
+  if (commaIdx >= 0 || preferCommaSurnameFirst) {
+    if (commaIdx >= 0) {
+      const family = cleanText(raw.slice(0, commaIdx));
+      const givenPart = cleanText(raw.slice(commaIdx + 1));
+      const suffixSplit = extractAuthorSuffix(splitGivenTokens(givenPart));
+      const author = {
+        raw,
+        family,
+        given: suffixSplit.tokens,
+        suffix: suffixSplit.suffix,
+        formattedApa: "",
+        parseMode: "comma_surname_first",
+        source: cleanText(options.source || ""),
+        confidence: "high",
+      };
+      author.formattedApa = formatApaAuthorFromStructured(author);
+      return { author, warnings };
+    }
+  }
+
+  const parts = raw.split(/\s+/).map((token) => normalizeAuthorToken(token)).filter(Boolean);
+  if (parts.length === 1) {
+    warnings.push("author_parse_low_confidence_mononym");
+    const author = {
+      raw,
+      family: "",
+      given: [],
+      suffix: "",
+      formattedApa: parts[0],
+      parseMode: "mononym",
+      source: cleanText(options.source || ""),
+      confidence: "low",
+    };
+    return { author, warnings };
+  }
+
+  let tokens = [...parts];
+  const suffixSplit = extractAuthorSuffix(tokens);
+  tokens = suffixSplit.tokens;
+  let familyTokens = [tokens.at(-1)];
+  let idx = tokens.length - 2;
+  while (idx >= 0) {
+    const tokenLower = String(tokens[idx] || "").toLowerCase();
+    if (AUTHOR_FAMILY_PARTICLES.has(tokenLower)) {
+      familyTokens.unshift(tokens[idx]);
+      idx -= 1;
+      continue;
+    }
+    break;
+  }
+  const familyStart = idx + 1;
+  const givenTokens = tokens.slice(0, familyStart);
+  const family = cleanText(familyTokens.join(" "));
+  const author = {
+    raw,
+    family,
+    given: givenTokens,
+    suffix: suffixSplit.suffix,
+    formattedApa: "",
+    parseMode: "space_given_first",
+    source: cleanText(options.source || ""),
+    confidence: "medium",
+  };
+  author.formattedApa = formatApaAuthorFromStructured(author);
+  if (!author.family) {
+    warnings.push("author_parse_missing_family_name");
+  }
+  return { author, warnings };
+}
+
+function parseAuthorList(authorNames, options = {}) {
+  const parsed = [];
+  const warnings = [];
+  const seen = new Set();
+  for (const rawName of authorNames || []) {
+    const { author, warnings: authorWarnings } = parseAuthorName(rawName, options);
+    for (const warning of authorWarnings || []) {
+      warnings.push(warning);
+    }
+    if (!author) continue;
+    const normalized = normalizeStructuredAuthorCandidate(author, options);
+    if (!normalized) continue;
+    const key = `${normalized.formattedApa}||${normalized.raw}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    parsed.push(normalized);
+  }
+  return { authors: parsed, warnings: uniqueStrings(warnings) };
+}
+
+function formatApaAuthorFromStructured(authorObj) {
+  if (!authorObj || typeof authorObj !== "object") return "";
+  const raw = stripAcademicHonorifics(authorObj.raw || "");
+  const family = cleanText(authorObj.family);
+  const given = Array.isArray(authorObj.given)
+    ? authorObj.given.map((token) => normalizeAuthorToken(token)).filter(Boolean)
+    : splitGivenTokens(authorObj.given || "");
+  const suffix = cleanText(authorObj.suffix);
+  const parseMode = cleanText(authorObj.parseMode);
+
+  if (parseMode === "corporate" || parseMode === "mononym") {
+    return raw || family || "";
+  }
+  if (!family) {
+    return raw || buildAuthorInitials(given) || "";
+  }
+  const initials = buildAuthorInitials(given);
+  let rendered = initials ? `${family}, ${initials}` : family;
+  if (suffix) {
+    rendered = `${rendered}, ${suffix}`;
+  }
+  return rendered;
+}
+
+function formatApaAuthorsFromStructured(authorObjs) {
   const deduped = [];
   const seen = new Set();
-  for (const name of authors || []) {
-    const formatted = formatApaAuthor(name);
+  for (const item of authorObjs || []) {
+    const formatted = formatApaAuthorFromStructured(item);
     if (!formatted) continue;
     const key = formatted.toLowerCase();
     if (seen.has(key)) continue;
@@ -725,8 +964,20 @@ function formatApaAuthors(authors) {
   return `${deduped.slice(0, -1).join(", ")}, & ${deduped.at(-1)}`;
 }
 
+function formatApaAuthor(name) {
+  const { authors } = parseAuthorList([name]);
+  return formatApaAuthorsFromStructured(authors);
+}
+
+function formatApaAuthors(authors) {
+  const { authors: parsed } = parseAuthorList(authors);
+  return formatApaAuthorsFromStructured(parsed);
+}
+
 function buildApaCitation(record) {
-  const authors = formatApaAuthors(record.authors || []);
+  const authors = Array.isArray(record.authorsStructured) && record.authorsStructured.length > 0
+    ? formatApaAuthorsFromStructured(record.authorsStructured)
+    : formatApaAuthors(record.authors || []);
   const year = cleanText(record.year);
   const title = cleanText(record.title);
   const journal = cleanText(record.journal);
@@ -1145,8 +1396,9 @@ function collectUnderscoreTextValues(node) {
   return uniqueStrings(values);
 }
 
-function extractScienceDirectAuthorsFromPreloadedState(state) {
+function extractScienceDirectAuthorsFromPreloadedStateDetailed(state) {
   const names = [];
+  const structured = [];
   const authorRoots = [];
   if (state?.authors?.content) {
     authorRoots.push(state.authors.content);
@@ -1172,10 +1424,59 @@ function extractScienceDirectAuthorsFromPreloadedState(state) {
       if (combined) {
         names.push(combined);
       }
+      if (given || surname) {
+        structured.push({
+          raw: combined || cleanText([surname, given].filter(Boolean).join(", ")),
+          family: surname,
+          given: given ? [given] : [],
+          suffix: "",
+          parseMode: "structured",
+          source: "preloaded_structured",
+          confidence: "high",
+        });
+      }
     });
   }
 
-  return uniqueStrings(names);
+  return {
+    names: uniqueStrings(names),
+    structured: structured
+      .map((item) => normalizeStructuredAuthorCandidate(item, { source: "preloaded_structured" }))
+      .filter(Boolean),
+  };
+}
+
+function extractScienceDirectAuthorsFromPreloadedState(state) {
+  return extractScienceDirectAuthorsFromPreloadedStateDetailed(state).names;
+}
+
+function extractStructuredAuthorsFromJsonLdPrimary(jsonLdPrimary, source = "jsonld_person") {
+  const authorNode = jsonLdPrimary?.author;
+  if (!authorNode) return [];
+  const list = Array.isArray(authorNode) ? authorNode : [authorNode];
+  const structured = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const family = cleanText(item.familyName || item.family_name || "");
+    const givenNameRaw = cleanText(item.givenName || item.given_name || "");
+    const given = givenNameRaw ? splitGivenTokens(givenNameRaw) : [];
+    const raw = cleanText(item.name || [givenNameRaw, family].filter(Boolean).join(" "));
+    if (!family && !given.length && !raw) continue;
+    const normalized = normalizeStructuredAuthorCandidate(
+      {
+        raw,
+        family,
+        given,
+        suffix: "",
+        parseMode: "structured",
+        source,
+        confidence: "high",
+      },
+      { source }
+    );
+    if (normalized) structured.push(normalized);
+  }
+  return structured;
 }
 
 function normalizeAbstractText(value) {
@@ -1280,6 +1581,7 @@ function extractMetadataFromScienceDirectHtml(html, sourceUrl, finalUrl) {
       })
     );
   })();
+  const jsonLdAuthorPersons = extractStructuredAuthorsFromJsonLdPrimary(jsonLdPrimary, "jsonld_person");
 
   const preloadedState = (() => {
     const rawJson = extractJsonObjectAfterMarker(html, "window.__PRELOADED_STATE__");
@@ -1298,7 +1600,9 @@ function extractMetadataFromScienceDirectHtml(html, sourceUrl, finalUrl) {
       preloadedArticle?.titleString ||
       ""
   );
-  const preloadedAuthors = extractScienceDirectAuthorsFromPreloadedState(preloadedState);
+  const preloadedAuthorsDetailed = extractScienceDirectAuthorsFromPreloadedStateDetailed(preloadedState);
+  const preloadedAuthors = preloadedAuthorsDetailed.names;
+  const preloadedAuthorsStructured = preloadedAuthorsDetailed.structured;
   const preloadedAbstractTexts = collectUnderscoreTextValues(preloadedState?.abstracts?.content || []);
   const preloadedJournal = cleanText(preloadedArticle?.srctitle || "");
   const preloadedVolume = cleanText(preloadedArticle?.["vol-first"] || "");
@@ -1344,11 +1648,23 @@ function extractMetadataFromScienceDirectHtml(html, sourceUrl, finalUrl) {
     pageTitle;
   const authorsFromMeta = pickMetaValues(metaMap, ["citation_author", "dc.creator"]);
   const authors =
-    authorsFromMeta.length > 0
-      ? authorsFromMeta
-      : preloadedAuthors.length > 0
-        ? preloadedAuthors
+    preloadedAuthors.length > 0
+      ? preloadedAuthors
+      : authorsFromMeta.length > 0
+        ? authorsFromMeta
         : jsonLdAuthorNames;
+  const authorsSourceKind =
+    preloadedAuthorsStructured.length > 0
+      ? "preloaded_structured"
+      : preloadedAuthors.length > 0
+        ? "preloaded_text"
+        : authorsFromMeta.length > 0
+          ? "meta"
+          : jsonLdAuthorPersons.length > 0
+            ? "jsonld_person"
+            : jsonLdAuthorNames.length > 0
+              ? "jsonld_name"
+              : "";
   const journal =
     pickMetaFirst(metaMap, ["citation_journal_title", "prism.publicationname", "dc.source"]) ||
     preloadedJournal ||
@@ -1392,6 +1708,20 @@ function extractMetadataFromScienceDirectHtml(html, sourceUrl, finalUrl) {
     finalUrl: ogUrl || finalUrl || sourceUrl,
     title,
     authors,
+    authorsFromMeta,
+    authorsFromJsonLdNames: jsonLdAuthorNames,
+    authorsFromPreloadedText: preloadedAuthors,
+    authorsSourceKind,
+    authorsStructuredCandidates:
+      preloadedAuthorsStructured.length > 0
+        ? preloadedAuthorsStructured
+        : jsonLdAuthorPersons,
+    authorsStructuredSourceKind:
+      preloadedAuthorsStructured.length > 0
+        ? "preloaded_structured"
+        : jsonLdAuthorPersons.length > 0
+          ? "jsonld_person"
+          : "",
     journal,
     publicationDate,
     volume,
@@ -1512,6 +1842,64 @@ async function waitForChallengeClear(page, args, verbose) {
   };
 }
 
+function normalizeStructuredAuthorList(authorList, options = {}) {
+  const parsed = [];
+  const seen = new Set();
+  for (const item of authorList || []) {
+    const normalized = normalizeStructuredAuthorCandidate(item, options);
+    if (!normalized) continue;
+    const key = `${normalized.formattedApa}||${normalized.raw}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    parsed.push(normalized);
+  }
+  return parsed;
+}
+
+function selectAuthorSourceForRecord(extracted, policyName = "") {
+  const hints = policyAuthorParsingHints(policyName);
+  const priority = Array.isArray(hints.authorSourcePriority) && hints.authorSourcePriority.length
+    ? hints.authorSourcePriority
+    : ["meta", "dom", "jsonld_person", "jsonld_name", "preloaded_structured", "preloaded_text"];
+  const structuredCandidates = normalizeStructuredAuthorList(extracted?.authorsStructuredCandidates || [], {
+    source: extracted?.authorsStructuredSourceKind || extracted?.authorsSourceKind || "",
+  });
+  const byKind = {
+    meta: uniqueStrings(extracted?.authorsFromMeta || []),
+    dom: uniqueStrings(extracted?.authorsFromDom || []),
+    jsonld_name: uniqueStrings(extracted?.authorsFromJsonLdNames || []),
+    preloaded_text: uniqueStrings(extracted?.authorsFromPreloadedText || []),
+    fallback: uniqueStrings(extracted?.authors || []),
+  };
+
+  for (const kind of priority) {
+    if (kind === "jsonld_person" || kind === "preloaded_structured") {
+      if (structuredCandidates.length > 0) {
+        return {
+          sourceKind: cleanText(extracted?.authorsStructuredSourceKind) || kind,
+          rawAuthors: uniqueStrings(structuredCandidates.map((item) => item.raw).filter(Boolean)),
+          structuredAuthors: structuredCandidates,
+        };
+      }
+      continue;
+    }
+    const rawAuthors = byKind[kind] || [];
+    if (rawAuthors.length > 0) {
+      return {
+        sourceKind: kind,
+        rawAuthors,
+        structuredAuthors: [],
+      };
+    }
+  }
+
+  return {
+    sourceKind: cleanText(extracted?.authorsSourceKind) || (byKind.fallback.length ? "fallback" : ""),
+    rawAuthors: byKind.fallback,
+    structuredAuthors: structuredCandidates,
+  };
+}
+
 function buildRecordFromExtracted(extracted, sourceUrl, policyName = "") {
   const doiUrl =
     normalizeDoi(extracted?.doiMeta) ||
@@ -1528,11 +1916,22 @@ function buildRecordFromExtracted(extracted, sourceUrl, policyName = "") {
     doiUrl,
   });
   const year = parseYear(extracted?.publicationDate || "");
+  const authorHints = policyAuthorParsingHints(policyName);
+  const selectedAuthors = selectAuthorSourceForRecord(extracted, policyName);
+  const parsedAuthors = selectedAuthors.structuredAuthors.length > 0
+    ? { authors: selectedAuthors.structuredAuthors, warnings: [] }
+    : parseAuthorList(selectedAuthors.rawAuthors || [], {
+        source: selectedAuthors.sourceKind,
+        preferCommaSurnameFirst: Boolean(authorHints.preferCommaSurnameFirst),
+      });
   const normalized = {
     sourceUrl: sourceUrl,
     finalUrl: extracted?.finalUrl || sourceUrl,
     title: ensureField(normalizedTitle),
-    authors: uniqueStrings(extracted?.authors || []),
+    authors: uniqueStrings(selectedAuthors.rawAuthors || extracted?.authors || []),
+    authorsStructured: parsedAuthors.authors || [],
+    authorSourceKind: cleanText(selectedAuthors.sourceKind) || "none",
+    authorParseWarnings: uniqueStrings(parsedAuthors.warnings || []),
     year: ensureField(year),
     journal: ensureField(inferredJournal || extracted?.journal),
     volume: ensureField(extracted?.volume),
@@ -1626,18 +2025,14 @@ async function extractMetadata(page, sourceUrl, policy) {
       );
     })();
 
-    const authors = (() => {
-      const byMeta = readMetaValues(["citation_author", "dc.creator"]);
-      if (byMeta.length) return byMeta;
-      const byDom = Array.from(
-        document.querySelectorAll(
-          'a[rel="author"], .author-name, .loa__author-name, .article-header__authors li'
-        )
+    const authorsFromMeta = readMetaValues(["citation_author", "dc.creator"]);
+    const authorsFromDom = Array.from(
+      document.querySelectorAll(
+        'a[rel="author"], .author-name, .loa__author-name, .article-header__authors li'
       )
-        .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
-        .filter(Boolean);
-      return byDom;
-    })();
+    )
+      .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
 
     const journal = (() => {
       const fromMeta = readMetaValues([
@@ -1680,6 +2075,8 @@ async function extractMetadata(page, sourceUrl, policy) {
       pubDate = pickText([".epub-section__date", ".publication-date", ".article-header__date"]);
     }
     let jsonLdType = "";
+    const jsonLdAuthorNames = [];
+    const jsonLdAuthorPersons = [];
     const jsonLdNodes = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
     for (const node of jsonLdNodes) {
       const raw = (node.textContent || "").trim();
@@ -1692,6 +2089,37 @@ async function extractMetadata(page, sourceUrl, policy) {
           const typeValue = String(candidate["@type"] || "").trim();
           if (!jsonLdType && typeValue) {
             jsonLdType = typeValue;
+          }
+          const authorNode = candidate.author;
+          if (authorNode) {
+            const authorList = Array.isArray(authorNode) ? authorNode : [authorNode];
+            for (const authorItem of authorList) {
+              if (typeof authorItem === "string") {
+                const cleaned = String(authorItem || "").replace(/\s+/g, " ").trim();
+                if (cleaned) jsonLdAuthorNames.push(cleaned);
+                continue;
+              }
+              if (!authorItem || typeof authorItem !== "object") continue;
+              const rawName = String(authorItem.name || "").replace(/\s+/g, " ").trim();
+              const family = String(authorItem.familyName || authorItem.family_name || "")
+                .replace(/\s+/g, " ")
+                .trim();
+              const givenRaw = String(authorItem.givenName || authorItem.given_name || "")
+                .replace(/\s+/g, " ")
+                .trim();
+              if (rawName) jsonLdAuthorNames.push(rawName);
+              if (family || givenRaw) {
+                jsonLdAuthorPersons.push({
+                  raw: rawName || `${givenRaw} ${family}`.trim(),
+                  family,
+                  given: givenRaw ? givenRaw.split(/\s+/).filter(Boolean) : [],
+                  suffix: "",
+                  parseMode: "structured",
+                  source: "jsonld_person",
+                  confidence: "high",
+                });
+              }
+            }
           }
           if (!pubDate) {
             const dateValue =
@@ -1774,6 +2202,22 @@ async function extractMetadata(page, sourceUrl, policy) {
 
     const abstractText = chooseBestAbstractLocal([abstractFromDom, ...abstractMetaCandidates]);
 
+    const authorsFromJsonLdNames = Array.from(
+      new Set(jsonLdAuthorNames.map((v) => String(v || "").replace(/\s+/g, " ").trim()).filter(Boolean))
+    );
+    const authors = (() => {
+      if (authorsFromMeta.length) return { list: authorsFromMeta, sourceKind: "meta" };
+      if (authorsFromDom.length) return { list: authorsFromDom, sourceKind: "dom" };
+      if (jsonLdAuthorPersons.length) {
+        const fallbackNames = jsonLdAuthorPersons
+          .map((item) => (item.raw || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean);
+        if (fallbackNames.length) return { list: fallbackNames, sourceKind: "jsonld_person" };
+      }
+      if (authorsFromJsonLdNames.length) return { list: authorsFromJsonLdNames, sourceKind: "jsonld_name" };
+      return { list: [], sourceKind: "" };
+    })();
+
     const pageRange = (() => {
       if (firstPage && lastPage) return `${firstPage}-${lastPage}`;
       if (firstPage) return firstPage;
@@ -1782,7 +2226,13 @@ async function extractMetadata(page, sourceUrl, policy) {
 
     return {
       title,
-      authors,
+      authors: authors.list,
+      authorsFromMeta,
+      authorsFromDom,
+      authorsFromJsonLdNames,
+      authorsSourceKind: authors.sourceKind,
+      authorsStructuredCandidates: jsonLdAuthorPersons,
+      authorsStructuredSourceKind: jsonLdAuthorPersons.length ? "jsonld_person" : "",
       journal,
       publicationDate: pubDate || "",
       volume,
@@ -2413,7 +2863,15 @@ async function main() {
   }
 }
 
-export { classifyArticleType, classifyKnownNonArticleLink, isTrackingUrl, normalizeArticleTypeValue };
+export {
+  classifyArticleType,
+  classifyKnownNonArticleLink,
+  isTrackingUrl,
+  normalizeArticleTypeValue,
+  parseAuthorName,
+  parseAuthorList,
+  formatApaAuthorFromStructured,
+};
 
 const IS_MAIN = (() => {
   try {

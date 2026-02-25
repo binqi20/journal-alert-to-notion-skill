@@ -18,7 +18,10 @@
 - `find_gmail_message.py` now auto-expands Gmail clipped-message webview links (`[Message clipped] View entire message`) and merges hidden paper links/body text before verification.
 - `verify_publisher_record.mjs` adds explicit Springer Link (`link.springer.com`) policy support and Springernature tracker-host support for `links.springernature.com`.
 - Verifier article-type classification now uses publisher raw-type precedence and emits trace fields (`articleTypeClassificationSource`, `articleTypeMatchedHint`) so Springer `Original Paper` is not misclassified by title heuristics (for example `Perspective`).
+- Verifier citation generation now uses a structured, source-aware author parser (supports mixed publisher author formats like `Last, First`, `First Last`, and structured JSON-LD/preloaded authors) and emits author trace fields (`authorsStructured`, `authorSourceKind`, `authorParseWarnings`).
+- Fixed Springer/JBE author-order citation errors (for example `Wang, Ziqiao` no longer becomes `Ziqiao, W.`) and validated JBE citation backfill for the Feb 24, 2026 issue import.
 - Added Springer fixture regression tests and Python unit tests for Gmail helper hydration/search-validation logic.
+- Added parser unit tests for author-name edge cases (family particles, hyphenated given names, corporate authors, suffixes) and mixed Springer/JBE comma-format names.
 - Validated live against a Journal of Business Ethics ToC alert (Feb 24, 2026, 4:09 PM) without manual Gmail probing or manual Springer article-type normalization.
 - Validated recovery of two clipped JBE papers from Gmail `view=lg&permmsgid` webview expansion (`Ethical Tools...`, `Navigating Ethical Waters...`) and imported them via Springer verification.
 
@@ -129,7 +132,7 @@ Recommended order for large alerts:
 
 ## Testing
 
-Run local parser regression tests (AOM/Atypon, Wiley, Springer fixtures):
+Run local parser regression tests (AOM/Atypon, Wiley, Springer fixtures + author parser unit tests):
 
 ```bash
 npm test

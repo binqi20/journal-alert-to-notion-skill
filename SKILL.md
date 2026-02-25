@@ -61,8 +61,11 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Resolves tracked email links (for example `click.skem1.com`, `el.aom.org`, `el.wiley.com`, `links.springernature.com`) to final article URLs before verification.
    - Re-evaluates domain policy after browser navigation/redirects (for example DOI -> Wiley final URL) so publisher-specific selectors still apply on the actual article page.
    - Includes explicit Springer Link (`link.springer.com`) policy selectors and Springer non-article link exclusions (issue/TOC/journal-home/email utility paths).
+   - Springer/JBE note: publisher `Original Paper` pages often expose comma-format author names (for example `Wang, Ziqiao`); the verifier preserves surname-first ordering when constructing APA citations.
    - Includes AOM/Atypon (`journals.aom.org`) metadata extraction support using `dc.*` tags + DOM fallbacks (journal breadcrumb, online date, article type).
    - Strips academic honorifics (for example `Dr.`, `Professor`) before APA author formatting.
+   - Uses a structured author parser before citation generation so mixed publisher author formats (`Last, First`, `First Last`, and structured JSON-LD/preloaded people objects) are normalized consistently across Springer, Wiley, AOM, and ScienceDirect.
+   - Applies publisher-specific author-source precedence (for example Springer meta names and ScienceDirect preloaded structured authors) before formatting APA citations.
    - Chooses the best abstract candidate across DOM + meta tags, penalizing truncated teaser snippets (for example `...`) and common issue/TOC prompts.
    - Uses source-aware article-type classification with publisher raw-type precedence (for example Springer `Original Paper` remains `research-article` even if the title contains words like `Perspective`).
    - Accepts either a link-list JSON or the full `find_gmail_message.py` `*_match.json` output (`candidates[*]`) as verifier input.
@@ -303,6 +306,9 @@ If still blocked, mark missing fields as `[Not verified]` and do not auto-ingest
 - `year`
 - `abstract`
 - `citation`
+- `authorsStructured` (optional, additive trace field)
+- `authorSourceKind` (optional, additive trace field)
+- `authorParseWarnings` (optional, additive trace field)
 
 If any required field is missing, set `[Not verified]` and skip ingestion.
 
@@ -311,6 +317,7 @@ If any required field is missing, set `[Not verified]` and skip ingestion.
 - Prefer publisher-provided citation export if available on the page and complete.
 - Otherwise construct APA 7 manually from verified fields:
   - `Author, A. A., & Author, B. B. (Year). Title of article. Journal Name, volume(issue), pages. https://doi.org/...`
+- When parsing author names manually, normalize mixed source formats first (`Last, First` vs `First Last`) before generating initials; do not assume a single author-name ordering across publishers.
 - Use `Advance online publication` only if explicitly stated by source.
 - If any citation-critical field is missing and cannot be verified, set citation to `[Not verified]`.
 
