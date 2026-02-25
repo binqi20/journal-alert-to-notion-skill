@@ -48,8 +48,10 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Records Gmail UI row probes (`ui_probe`) and per-attempt list hydration diagnostics (`list_hydration`) to explain dynamic Gmail 0-row states and retry/refresh behavior.
    - Emits phase progress checkpoints during long Playwright runs (for example candidate row/open/extract phases) to `<output>.partial.json` when `--output` is set.
    - Adds row-open retries and extraction-phase warnings so a single Gmail thread/render failure does not abort an entire strategy attempt.
+   - Auto-expands Gmail clipped-message webview links (`mail.google.com ... view=lg&permmsgid=...`, shown as `[Message clipped] View entire message`) inside the same authenticated Gmail session and merges hidden links/body text into the extracted candidate.
    - Filters alert-management links at extraction time (`unsubscribe`, `removeAlert`, manage-alert/preferences anchors) so `links` and `link_details` are safe verification candidates by default.
    - Filters unsupported schemes (for example `mailto:`, `tel:`, `javascript:`) out of verification candidates during extraction.
+   - Blocks Gmail full-message webview URLs from verification candidates after expansion (`gmail_message_webview_link`) while preserving them in `all_links` / `blocked_link_details` for audit/debugging.
    - Preserves raw link capture for audit/debugging via `all_links` / `all_link_details`, and records blocked entries in `blocked_links` / `blocked_link_details` (with `reason` labels).
    - Dependencies:
      - `browser-cookie3` for cookie extraction (`uv pip install browser-cookie3`)
@@ -216,6 +218,7 @@ Use this escalation path; stop at the first reliable method.
 - Wait for stable render (`networkidle` plus explicit content checks).
 - Prefer concrete Gmail surface readiness checks (rows/message header/search input) before `networkidle`; use `networkidle` only as a short fallback because Gmail often keeps background requests alive.
 - If Gmail search/crawl shows `0` rows while the shell/search UI is present, use the helper’s hydration retry diagnostics (`ui_probe`, `list_hydration`) before concluding the email is missing.
+- If Gmail displays `[Message clipped] View entire message`, use the helper output after the auto-expansion path; it now opens the Gmail webview link and merges the hidden article links before verification.
 - For long-running scans, inspect `<output>.partial.json` to see the latest phase (`candidate_row_match`, `candidate_opened`, `candidate_extracted`) before killing/retrying the run.
 - New partial-checkpoint phases may include `list_hydration_probe`, `list_hydration_retry`, `list_hydration_recovered`, and `list_hydration_failed` when Gmail rows are delayed.
 - Validate search state using row-content heuristics (not URL state alone) when Gmail appears to keep inbox-like rows under a `#search/...` URL.

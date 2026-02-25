@@ -21,7 +21,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import HTTPCookieProcessor, HTTPSHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
@@ -419,6 +419,8 @@ def _unsupported_link_scheme_reason(href: str | None) -> str | None:
 
 
 def _blocked_link_reason(*, href: str | None, text: str | None) -> str | None:
+    if _is_gmail_full_message_webview_link(href):
+        return "gmail_message_webview_link"
     return _alert_management_link_reason(href=href, text=text) or _unsupported_link_scheme_reason(href)
 
 
@@ -813,6 +815,114 @@ def _safe_link_details(page: Any) -> list[dict[str, str]]:
             continue
         details.append({"href": href, "text": _safe_inner_text(node)})
     return details
+
+
+def _safe_link_details_any(page: Any, *, max_links: int = 800) -> list[dict[str, str]]:
+    details: list[dict[str, str]] = []
+    try:
+        links = page.locator("a[href]")
+        count = min(links.count(), max_links)
+    except Exception:
+        return details
+    for idx in range(count):
+        node = links.nth(idx)
+        href = _safe_attr(node, "href")
+        if not href:
+            continue
+        details.append({"href": href, "text": _safe_inner_text(node)})
+    return details
+
+
+def _normalize_link_href(value: str | None) -> str:
+    href = (value or "").strip()
+    if not href:
+        return ""
+    if href.startswith("//"):
+        return f"https:{href}"
+    return href
+
+
+def _is_gmail_full_message_webview_link(href: str | None) -> bool:
+    normalized = _normalize_link_href(href)
+    if not normalized:
+        return False
+    try:
+        parsed = urlparse(normalized)
+    except Exception:
+        return False
+    host = (parsed.netloc or "").lower()
+    if "mail.google.com" not in host:
+        return False
+    query = parse_qs(parsed.query or "")
+    view_value = ((query.get("view") or [""])[0] or "").lower()
+    permmsgid_value = ((query.get("permmsgid") or [""])[0] or "").strip()
+    return view_value == "lg" and bool(permmsgid_value)
+
+
+def _merge_link_details(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            href = _normalize_link_href(item.get("href"))
+            text = str(item.get("text") or "").strip()
+            if not href:
+                continue
+            key = (href, text)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({"href": href, "text": text})
+    return merged
+
+
+def _expand_gmail_webview_message(
+    page: Any,
+    *,
+    webview_url: str,
+    include_body: bool,
+    verbose: bool,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "attempted": True,
+        "expanded": False,
+        "webview_url": webview_url,
+        "final_url": "",
+        "error": "",
+        "added_link_count": 0,
+        "all_link_count": 0,
+    }
+    popup = None
+    try:
+        popup = page.context.new_page()
+        popup.goto(webview_url, wait_until="domcontentloaded", timeout=45000)
+        popup.wait_for_timeout(800)
+        result["final_url"] = str(getattr(popup, "url", "") or "")
+        if "accounts.google.com" in result["final_url"]:
+            result["error"] = "redirected_to_google_signin"
+            return result
+        try:
+            popup.wait_for_selector("body", state="attached", timeout=5000)
+        except Exception:
+            _log("Gmail webview body selector wait timed out; continuing.", enabled=verbose)
+        link_details = _safe_link_details_any(popup)
+        result["all_link_count"] = len(link_details)
+        result["link_details"] = link_details
+        if include_body:
+            result["body_text"] = _safe_inner_text(popup.locator("body").first)
+        result["expanded"] = bool(link_details) or bool(result.get("body_text"))
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+    finally:
+        if popup is not None:
+            try:
+                popup.close()
+            except Exception:
+                pass
 
 
 def _wait_for_gmail_surface(page: Any, *, verbose: bool, phase: str) -> None:
@@ -1218,6 +1328,7 @@ def _extract_message_candidate(
     tz: dt.tzinfo,
     include_body: bool,
     date_only_mode: bool,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     message_subject = _safe_inner_text(page.locator("h2.hP").first) or row_subject
     sender_chip = page.locator("span.gD").first
@@ -1246,20 +1357,76 @@ def _extract_message_candidate(
         if row_parsed is not None:
             parsed_datetimes.append(row_parsed)
 
-    link_details = _safe_link_details(page)
-    all_link_details = link_details
-    all_links = [str(item.get("href") or "").strip() for item in all_link_details if isinstance(item, dict)] or []
+    thread_link_details = _safe_link_details(page)
+    all_link_details = thread_link_details
+    all_links = [
+        _normalize_link_href(item.get("href")) for item in all_link_details if isinstance(item, dict)
+    ] or []
     if not all_links and all_link_details:
         # Defensive fallback in case Playwright returns a list of href strings from older runtimes.
         all_links = [str(item).strip() for item in all_link_details if str(item).strip()]
         all_link_details = [{"href": href, "text": ""} for href in all_links]
+
+    body_text = None
+    if include_body:
+        body_text = _safe_inner_text(page.locator("div.a3s").first)
+
+    gmail_webview_expansion: dict[str, Any] | None = None
+    webview_links = [
+        _normalize_link_href(item.get("href"))
+        for item in all_link_details
+        if isinstance(item, dict) and _is_gmail_full_message_webview_link(item.get("href"))
+    ]
+    if webview_links:
+        webview_url = webview_links[0]
+        _log(
+            f"Expanding clipped Gmail message via webview link: {webview_url}",
+            enabled=verbose,
+        )
+        expansion = _expand_gmail_webview_message(
+            page,
+            webview_url=webview_url,
+            include_body=include_body,
+            verbose=verbose,
+        )
+        extra_link_details = [
+            item for item in expansion.get("link_details") or [] if isinstance(item, dict)
+        ]
+        merged_link_details = _merge_link_details(all_link_details, extra_link_details)
+        added_link_count = max(0, len(merged_link_details) - len(_merge_link_details(all_link_details)))
+        all_link_details = merged_link_details
+        all_links = [
+            _normalize_link_href(item.get("href")) for item in all_link_details if isinstance(item, dict)
+        ]
+        gmail_webview_expansion = {
+            "attempted": bool(expansion.get("attempted")),
+            "expanded": bool(expansion.get("expanded")),
+            "webview_url": webview_url,
+            "final_url": str(expansion.get("final_url") or ""),
+            "error": str(expansion.get("error") or ""),
+            "base_link_count": len(thread_link_details),
+            "webview_link_count": len(extra_link_details),
+            "merged_link_count": len(all_link_details),
+            "added_link_count": added_link_count,
+        }
+        if include_body:
+            webview_body_text = str(expansion.get("body_text") or "")
+            if webview_body_text:
+                candidate_body_source = "gmail_thread"
+                if len(webview_body_text.strip()) > len((body_text or "").strip()):
+                    body_text = webview_body_text
+                    candidate_body_source = "gmail_webview"
+                else:
+                    candidate_body_source = "gmail_thread"
+                gmail_webview_expansion["body_text_length"] = len(webview_body_text)
+                gmail_webview_expansion["body_text_used"] = candidate_body_source == "gmail_webview"
 
     blocked_link_details: list[dict[str, str]] = []
     safe_link_details: list[dict[str, str]] = []
     for item in all_link_details:
         if not isinstance(item, dict):
             continue
-        href_value = str(item.get("href") or "").strip()
+        href_value = _normalize_link_href(item.get("href"))
         text_value = str(item.get("text") or "").strip()
         normalized = {"href": href_value, "text": text_value}
         if not href_value:
@@ -1272,10 +1439,6 @@ def _extract_message_candidate(
 
     links = [item["href"] for item in safe_link_details]
     blocked_links = [item["href"] for item in blocked_link_details]
-
-    body_text = None
-    if include_body:
-        body_text = _safe_inner_text(page.locator("div.a3s").first)
 
     minute_match = any(_same_minute(value, target_dt, tz) for value in parsed_datetimes)
     date_match = any(_same_local_date(value, target_date, tz) for value in parsed_datetimes)
@@ -1301,6 +1464,13 @@ def _extract_message_candidate(
     }
     if include_body:
         candidate["body_text"] = body_text
+        candidate["body_text_source"] = (
+            "gmail_webview"
+            if gmail_webview_expansion and gmail_webview_expansion.get("body_text_used")
+            else "gmail_thread"
+        )
+    if gmail_webview_expansion is not None:
+        candidate["gmail_webview_expansion"] = gmail_webview_expansion
     candidate["time_match_mode"] = "date" if date_only_mode else "minute"
     return candidate
 
@@ -1474,6 +1644,7 @@ def _scan_current_view(
                     tz=tz,
                     include_body=include_body,
                     date_only_mode=date_only_mode,
+                    verbose=verbose,
                 )
             except Exception as exc:
                 warnings.append(

@@ -78,5 +78,24 @@ class SearchValidationTests(unittest.TestCase):
         )
 
 
+class GmailClippedMessageExpansionTests(unittest.TestCase):
+    def test_detects_gmail_full_message_webview_link(self) -> None:
+        href = (
+            "https://mail.google.com/mail/u/0/?ui=2&ik=abc123&view=lg"
+            "&permmsgid=msg-f:1857993378466304732"
+        )
+        self.assertTrue(MODULE._is_gmail_full_message_webview_link(href))
+
+    def test_blocks_gmail_full_message_webview_from_verification_candidates(self) -> None:
+        href = (
+            "https://mail.google.com/mail/u/0/?ui=2&ik=abc123&view=lg"
+            "&permmsgid=msg-f:1857993378466304732"
+        )
+        self.assertEqual(
+            MODULE._blocked_link_reason(href=href, text="View entire message"),
+            "gmail_message_webview_link",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

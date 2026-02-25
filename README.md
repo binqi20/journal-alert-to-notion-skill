@@ -15,10 +15,12 @@
 - Gmail helper adds list-row hydration retries and diagnostics (`ui_probe`, `list_hydration`) to avoid false `0`-row misses when the Gmail shell renders before message rows attach.
 - Gmail search validation now treats shell-present + `0` rows as an inconclusive UI state (not a trustworthy empty search) and can refresh the view once before downgrading a strategy.
 - `find_gmail_message.py` adds `--row-hydration-timeout-ms` and `--zero-row-retries` for tuning Gmail row hydration behavior.
+- `find_gmail_message.py` now auto-expands Gmail clipped-message webview links (`[Message clipped] View entire message`) and merges hidden paper links/body text before verification.
 - `verify_publisher_record.mjs` adds explicit Springer Link (`link.springer.com`) policy support and Springernature tracker-host support for `links.springernature.com`.
 - Verifier article-type classification now uses publisher raw-type precedence and emits trace fields (`articleTypeClassificationSource`, `articleTypeMatchedHint`) so Springer `Original Paper` is not misclassified by title heuristics (for example `Perspective`).
 - Added Springer fixture regression tests and Python unit tests for Gmail helper hydration/search-validation logic.
 - Validated live against a Journal of Business Ethics ToC alert (Feb 24, 2026, 4:09 PM) without manual Gmail probing or manual Springer article-type normalization.
+- Validated recovery of two clipped JBE papers from Gmail `view=lg&permmsgid` webview expansion (`Ethical Tools...`, `Navigating Ethical Waters...`) and imported them via Springer verification.
 
 ## Recent Improvements (v0.1.3)
 
@@ -151,6 +153,8 @@ These tests validate recent parser improvements plus Gmail zero-row hydration/se
   Inspect `attempts[*].ui_probe` and `attempts[*].list_hydration` (and `<output>.partial.json` if present). The helper now retries row hydration and may refresh the view once before downgrading a search/crawl attempt.
 - Gmail helper looks stalled during a long Playwright run:
   If `--output` is set, inspect `<output>.partial.json` to see the latest phase (`list_hydration_*`, `candidate_row_match`, `candidate_opened`, `candidate_extracted`) and current strategy.
+- Gmail email body is clipped and missing paper links:
+  The helper now auto-expands Gmail webview links (`view=lg&permmsgid`) and merges hidden links into `all_link_details`/`links`. Check `match.gmail_webview_expansion` in the JSON output to confirm expansion succeeded and how many links were added.
 - Protected publisher pages (Cloudflare / anti-bot):
   Prefer running with a normal authenticated Chrome session and attach via `--cdp-url` when verification is blocked.
 - Wiley / SMJ challenge in headless verification:
