@@ -34,6 +34,9 @@ jobs:
           python3 -m py_compile scripts/find_gmail_message.py
           python3 -m py_compile scripts/build_notion_payload.py
 
+      - name: Python helper unit tests
+        run: python3 -m unittest discover -s tests -p 'test_find_gmail_message_helpers.py'
+
       - name: Node syntax check
         run: node --check scripts/verify_publisher_record.mjs
 

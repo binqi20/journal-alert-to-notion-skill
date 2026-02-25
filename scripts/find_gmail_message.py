@@ -155,6 +155,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--row-hydration-timeout-ms",
+        type=int,
+        default=7000,
+        help="Max wait for Gmail list rows to hydrate before treating a 0-row view as real.",
+    )
+    parser.add_argument(
+        "--zero-row-retries",
+        type=int,
+        default=2,
+        help="Extra hydration retries when Gmail shell is present but list rows are 0.",
+    )
+    parser.add_argument(
         "--include-body",
         action="store_true",
         help="Include message body text for matched session results.",
@@ -842,6 +854,166 @@ def _wait_for_gmail_surface(page: Any, *, verbose: bool, phase: str) -> None:
     page.wait_for_timeout(500)
 
 
+def _safe_count(locator: Any, limit: int | None = None) -> int:
+    try:
+        count = int(locator.count())
+    except Exception:
+        return 0
+    if limit is not None and count > limit:
+        return limit
+    return max(0, count)
+
+
+def _gmail_list_row_locators(page: Any) -> list[tuple[str, Any]]:
+    return [
+        ("tr.zA", page.locator("tr.zA")),
+        ('tr[role="row"]:has(span.bog)', page.locator('tr[role="row"]:has(span.bog)')),
+        ('[role="main"] tr:has(span.bog)', page.locator('[role="main"] tr:has(span.bog)')),
+    ]
+
+
+def _select_gmail_list_rows(page: Any) -> tuple[Any, dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    fallback_locator = page.locator("tr.zA")
+    fallback_selector = "tr.zA"
+    for selector, locator in _gmail_list_row_locators(page):
+        count = _safe_count(locator)
+        candidates.append({"selector": selector, "count": count})
+        if count > 0:
+            return locator, {"selector": selector, "row_count": count, "candidates": candidates}
+        if selector == "tr.zA":
+            fallback_locator = locator
+            fallback_selector = selector
+    return fallback_locator, {"selector": fallback_selector, "row_count": 0, "candidates": candidates}
+
+
+def _probe_gmail_list_ui(page: Any) -> dict[str, Any]:
+    spinner_selectors = [
+        'div[role="progressbar"]',
+        '[aria-label*="Loading"]',
+        '[aria-label*="loading"]',
+        ".v2",
+        ".aAk",
+    ]
+    spinner_hits: list[dict[str, Any]] = []
+    for selector in spinner_selectors:
+        count = _safe_count(page.locator(selector))
+        if count:
+            spinner_hits.append({"selector": selector, "count": count})
+    rows_locator, row_pick = _select_gmail_list_rows(page)
+    probe = {
+        "url": str(getattr(page, "url", "") or ""),
+        "zA_rows": _safe_count(page.locator("tr.zA")),
+        "role_rows": _safe_count(page.locator('tr[role="row"]')),
+        "selected_row_selector": row_pick.get("selector"),
+        "selected_row_count": int(row_pick.get("row_count") or 0),
+        "row_candidates": row_pick.get("candidates") or [],
+        "bog_nodes": _safe_count(page.locator("span.bog")),
+        "search_inputs": _safe_count(
+            page.locator('input[aria-label="Search mail"], input[name="q"]')
+        ),
+        "main_regions": _safe_count(page.locator('[role="main"]')),
+        "message_headers": _safe_count(page.locator("h2.hP")),
+        "spinners": spinner_hits,
+    }
+    # Keep a direct shell flag for downstream diagnostics/decision logic.
+    probe["shell_present"] = bool(
+        probe["search_inputs"] or probe["main_regions"] or probe["message_headers"]
+    )
+    return probe
+
+
+def _gmail_zero_row_ui_is_ambiguous(ui_probe: dict[str, Any] | None) -> bool:
+    probe = ui_probe or {}
+    selected_row_count = int(probe.get("selected_row_count") or 0)
+    bog_nodes = int(probe.get("bog_nodes") or 0)
+    shell_present = bool(probe.get("shell_present"))
+    if selected_row_count > 0 or bog_nodes > 0:
+        return False
+    return shell_present
+
+
+def _wait_for_list_rows_hydration(
+    page: Any,
+    *,
+    verbose: bool,
+    strategy_name: str,
+    page_index: int,
+    timeout_ms: int,
+    zero_row_retries: int,
+) -> tuple[Any, dict[str, Any]]:
+    timeout_ms = max(int(timeout_ms or 0), 0)
+    zero_row_retries = max(int(zero_row_retries or 0), 0)
+    poll_ms = 400
+    attempts: list[dict[str, Any]] = []
+    recovered = False
+    retry_count = 0
+    last_rows, last_pick = _select_gmail_list_rows(page)
+    last_probe = _probe_gmail_list_ui(page)
+    started_ts = dt.datetime.now().timestamp()
+
+    while True:
+        elapsed_ms = int((dt.datetime.now().timestamp() - started_ts) * 1000)
+        selected_row_count = int(last_pick.get("row_count") or 0)
+        ambiguous = _gmail_zero_row_ui_is_ambiguous(last_probe)
+        probe_snapshot = dict(last_probe)
+        attempts.append(
+            {
+                "probe": probe_snapshot,
+                "selected_row_selector": last_pick.get("selector"),
+                "selected_row_count": selected_row_count,
+                "elapsed_ms": elapsed_ms,
+                "ambiguous_zero_rows": ambiguous,
+                "retry_index": retry_count,
+            }
+        )
+        if selected_row_count > 0:
+            break
+
+        # If Gmail shell is absent and rows are zero, allow one short wait to avoid
+        # racing DOM attach, but don't spin through all zero-row retries.
+        if not ambiguous and elapsed_ms >= max(timeout_ms, poll_ms):
+            break
+
+        if elapsed_ms < timeout_ms:
+            page.wait_for_timeout(poll_ms)
+            last_rows, last_pick = _select_gmail_list_rows(page)
+            last_probe = _probe_gmail_list_ui(page)
+            continue
+
+        if ambiguous and retry_count < zero_row_retries:
+            retry_count += 1
+            _log(
+                f"[{strategy_name}] page {page_index}: Gmail shell is present but rows are 0; hydration retry {retry_count}/{zero_row_retries}.",
+                enabled=verbose,
+            )
+            page.wait_for_timeout(900)
+            last_rows, last_pick = _select_gmail_list_rows(page)
+            last_probe = _probe_gmail_list_ui(page)
+            if int(last_pick.get("row_count") or 0) > 0:
+                recovered = True
+            continue
+        break
+
+    final_ambiguous = _gmail_zero_row_ui_is_ambiguous(last_probe)
+    info = {
+        "strategy": strategy_name,
+        "page": page_index,
+        "selected_row_selector": last_pick.get("selector"),
+        "selected_row_count": int(last_pick.get("row_count") or 0),
+        "hydrated": bool(int(last_pick.get("row_count") or 0) > 0),
+        "recovered_from_zero_rows": recovered,
+        "zero_row_ambiguous": final_ambiguous,
+        "retry_count": retry_count,
+        "timeout_ms": timeout_ms,
+        "attempts": attempts[:8],
+        "ui_probe": last_probe,
+        "refresh_attempted": False,
+        "refresh_recovered": False,
+    }
+    return last_rows, info
+
+
 def _gmail_view_url(
     *,
     mailbox: str,
@@ -869,9 +1041,10 @@ def _is_inbox_like_url(url: str) -> bool:
 
 def _first_list_row_signature(page: Any) -> str:
     try:
-        row = page.locator("tr.zA").first
-        if not row.count():
+        rows, picked = _select_gmail_list_rows(page)
+        if int(picked.get("row_count") or 0) <= 0:
             return ""
+        row = rows.first
         subject = _safe_inner_text(row.locator("span.bog").first)
         sender = _safe_inner_text(row.locator("span.zF, span.yP").first)
         when = _safe_attr(row.locator("td.xW span").first, "title") or _safe_inner_text(
@@ -899,10 +1072,14 @@ def _search_results_content_looks_valid(
     page1_rows: int,
     page1_exact_hits: int,
     page1_broad_hits: int,
+    page1_hydrated: bool = True,
+    page1_zero_row_ambiguous: bool = False,
 ) -> bool:
     if not strategy_name.startswith("search_"):
         return True
     if page1_rows <= 0:
+        if page1_zero_row_ambiguous or not page1_hydrated:
+            return False
         return True
 
     exact_subject_strategies = {
@@ -1139,6 +1316,8 @@ def _scan_current_view(
     tz: dt.tzinfo,
     max_rows: int,
     max_pages: int,
+    row_hydration_timeout_ms: int,
+    zero_row_retries: int,
     include_body: bool,
     verbose: bool,
     date_only_mode: bool,
@@ -1152,20 +1331,65 @@ def _scan_current_view(
     page1_exact_subject_hits = 0
     page1_broad_subject_hits = 0
     page1_rows = 0
+    page1_hydrated = True
+    page1_zero_row_ambiguous = False
+    page1_ui_probe: dict[str, Any] = {}
+    page1_list_hydration: dict[str, Any] = {}
 
     for page_index in range(1, max_pages + 1):
-        rows = page.locator("tr.zA")
-        row_count = min(rows.count(), max_rows)
+        if progress_callback is not None:
+            progress_callback("list_hydration_probe", {"page": page_index, "strategy": strategy_name})
+        rows, hydration = _wait_for_list_rows_hydration(
+            page,
+            verbose=verbose,
+            strategy_name=strategy_name,
+            page_index=page_index,
+            timeout_ms=row_hydration_timeout_ms,
+            zero_row_retries=zero_row_retries,
+        )
+        row_count = min(int(hydration.get("selected_row_count") or 0), max_rows)
         pages_scanned += 1
         if page_index == 1:
             page1_rows = row_count
+            page1_hydrated = bool(hydration.get("hydrated"))
+            page1_zero_row_ambiguous = bool(hydration.get("zero_row_ambiguous"))
+            page1_ui_probe = hydration.get("ui_probe") or {}
+            page1_list_hydration = {
+                k: v
+                for k, v in hydration.items()
+                if k != "ui_probe"
+            }
+        if progress_callback is not None:
+            phase_name = "list_hydration_recovered" if hydration.get("recovered_from_zero_rows") else (
+                "list_hydration_failed" if row_count <= 0 else "list_hydration_probe"
+            )
+            progress_callback(
+                phase_name,
+                {
+                    "page": page_index,
+                    "strategy": strategy_name,
+                    "row_count": row_count,
+                    "hydrated": bool(hydration.get("hydrated")),
+                    "zero_row_ambiguous": bool(hydration.get("zero_row_ambiguous")),
+                    "selected_row_selector": hydration.get("selected_row_selector"),
+                    "retry_count": int(hydration.get("retry_count") or 0),
+                    "ui_probe": hydration.get("ui_probe") or {},
+                },
+            )
+        if row_count <= 0:
+            if bool(hydration.get("zero_row_ambiguous")):
+                warnings.append(f"{strategy_name}: ui_shell_present_but_rows_missing on page {page_index}")
+            elif not bool(hydration.get("hydrated")):
+                warnings.append(f"{strategy_name}: gmail_list_not_hydrated on page {page_index}")
+            else:
+                warnings.append(f"{strategy_name}: zero_rows_after_hydration on page {page_index}")
         _log(
             f"[{strategy_name}] scanning page {page_index}/{max_pages}, rows={row_count}",
             enabled=verbose,
         )
 
         for row_index in range(row_count):
-            row = page.locator("tr.zA").nth(row_index)
+            row = rows.nth(row_index)
             row_subject = _safe_inner_text(row.locator("span.bog").first)
             row_sender = _safe_inner_text(row.locator("span.zF, span.yP").first)
             row_time_hint = _safe_attr(row.locator("td.xW span").first, "title")
@@ -1293,7 +1517,11 @@ def _scan_current_view(
                         "page1_rows": page1_rows,
                         "page1_exact_subject_hits": page1_exact_subject_hits,
                         "page1_broad_subject_hits": page1_broad_subject_hits,
+                        "page1_hydrated": page1_hydrated,
+                        "page1_zero_row_ambiguous": page1_zero_row_ambiguous,
                     },
+                    "ui_probe": page1_ui_probe,
+                    "list_hydration": {"page1": page1_list_hydration},
                     "final_url": page.url,
                 }
 
@@ -1319,7 +1547,11 @@ def _scan_current_view(
             "page1_rows": page1_rows,
             "page1_exact_subject_hits": page1_exact_subject_hits,
             "page1_broad_subject_hits": page1_broad_subject_hits,
+            "page1_hydrated": page1_hydrated,
+            "page1_zero_row_ambiguous": page1_zero_row_ambiguous,
         },
+        "ui_probe": page1_ui_probe,
+        "list_hydration": {"page1": page1_list_hydration},
         "final_url": page.url,
     }
 
@@ -1360,6 +1592,8 @@ def _playwright_lookup(
     max_rows: int,
     max_pages: int,
     date_window_days: int,
+    row_hydration_timeout_ms: int,
+    zero_row_retries: int,
     include_body: bool,
     verbose: bool,
     checkpoint_path: Path | None = None,
@@ -1481,6 +1715,9 @@ def _playwright_lookup(
                     "rows_scanned": 0,
                     "sample_rows": [],
                     "candidate_count": 0,
+                    "ui_probe": {},
+                    "list_hydration": {},
+                    "search_validation": None,
                     "found": False,
                     "error": None,
                 }
@@ -1509,29 +1746,93 @@ def _playwright_lookup(
                             )
                             continue
 
-                    scan = _scan_current_view(
-                        page=page,
-                        strategy_name=str(strategy.get("name") or ""),
-                        subject=subject,
-                        target_dt=target_dt,
-                        target_date=target_date,
-                        sender=sender,
-                        tz=tz,
-                        max_rows=max_rows,
-                        max_pages=max_pages,
-                        include_body=include_body,
-                        verbose=verbose,
-                        date_only_mode=date_only_mode,
-                        progress_callback=lambda phase, info, _attempt=attempt: emit_checkpoint(
-                            phase,
-                            {"current_attempt": _attempt.get("name"), "progress": info},
-                        ),
-                    )
+                    scan: dict[str, Any] | None = None
+                    for scan_round in range(1, 3):
+                        scan = _scan_current_view(
+                            page=page,
+                            strategy_name=str(strategy.get("name") or ""),
+                            subject=subject,
+                            target_dt=target_dt,
+                            target_date=target_date,
+                            sender=sender,
+                            tz=tz,
+                            max_rows=max_rows,
+                            max_pages=max_pages,
+                            row_hydration_timeout_ms=row_hydration_timeout_ms,
+                            zero_row_retries=zero_row_retries,
+                            include_body=include_body,
+                            verbose=verbose,
+                            date_only_mode=date_only_mode,
+                            progress_callback=lambda phase, info, _attempt=attempt: emit_checkpoint(
+                                phase,
+                                {"current_attempt": _attempt.get("name"), "progress": info},
+                            ),
+                        )
+                        page1_hydration = ((scan.get("list_hydration") or {}).get("page1") or {})
+                        if int(page1_hydration.get("retry_count") or 0) > 0:
+                            emit_checkpoint(
+                                "list_hydration_retry",
+                                {
+                                    "current_attempt": attempt.get("name"),
+                                    "retry_count": int(page1_hydration.get("retry_count") or 0),
+                                    "page1": page1_hydration,
+                                },
+                            )
+
+                        zero_row_ambiguous = bool(page1_hydration.get("zero_row_ambiguous"))
+                        page1_rows_scanned = int(
+                            ((scan.get("search_row_probe") or {}).get("page1_rows") or 0)
+                        )
+                        if (
+                            scan_round == 1
+                            and not bool(scan.get("found"))
+                            and str(strategy.get("mode") or "") in {"search", "search_input", "crawl"}
+                            and zero_row_ambiguous
+                            and page1_rows_scanned <= 0
+                        ):
+                            page1_hydration["refresh_attempted"] = True
+                            attempt.setdefault("list_hydration", {})
+                            attempt["list_hydration"] = {"page1": page1_hydration}
+                            refresh_warning = (
+                                f"{strategy.get('name')}: page 1 had 0 rows with Gmail shell present; refreshing view once before downgrading the attempt."
+                            )
+                            if refresh_warning not in fallback_warnings:
+                                fallback_warnings.append(refresh_warning)
+                            emit_checkpoint(
+                                "attempt_zero_row_refresh",
+                                {"current_attempt": attempt.get("name"), "page1": page1_hydration},
+                            )
+                            nav = _goto_mail_view(
+                                page,
+                                mailbox=mailbox,
+                                mode=str(strategy.get("mode", "")),
+                                query=strategy.get("query"),
+                                folder=strategy.get("folder"),
+                                verbose=verbose,
+                            )
+                            attempt["final_url"] = nav.get("current_url") or page.url
+                            if strategy.get("mode") in {"search", "search_input"}:
+                                attempt["search_applied"] = bool(nav.get("search_applied"))
+                                attempt["inbox_like"] = bool(nav.get("inbox_like"))
+                                if not attempt["search_applied"] or attempt["inbox_like"]:
+                                    emit_checkpoint(
+                                        "attempt_search_not_applied",
+                                        {"current_attempt": attempt.get("name"), "current_url": page.url},
+                                    )
+                                    scan = None
+                                    break
+                            continue
+                        break
+
+                    if scan is None:
+                        continue
                     attempt["pages_scanned"] = scan.get("pages_scanned", 0)
                     attempt["rows_scanned"] = scan.get("rows_scanned", 0)
                     attempt["sample_rows"] = scan.get("sample_rows", [])
                     attempt["candidate_count"] = len(scan.get("candidates", []))
                     attempt["final_url"] = scan.get("final_url")
+                    attempt["ui_probe"] = scan.get("ui_probe") or {}
+                    attempt["list_hydration"] = scan.get("list_hydration") or {}
                     attempt_warnings = [str(x) for x in scan.get("warnings", []) if str(x)]
                     if attempt_warnings:
                         attempt["warnings"] = attempt_warnings
@@ -1540,24 +1841,57 @@ def _playwright_lookup(
                         )
                     probe = scan.get("search_row_probe") or {}
                     attempt["search_row_probe"] = probe
-                    if strategy.get("mode") in {"search", "search_input"} and not _search_results_content_looks_valid(
-                        strategy_name=str(strategy.get("name") or ""),
-                        page1_rows=int(probe.get("page1_rows") or 0),
-                        page1_exact_hits=int(probe.get("page1_exact_subject_hits") or 0),
-                        page1_broad_hits=int(probe.get("page1_broad_subject_hits") or 0),
-                    ):
-                        attempt["content_mismatch"] = True
-                        attempt["search_applied"] = False
-                        mismatch_warning = (
-                            f"{strategy.get('name')}: Gmail URL looked like search mode, but first-page row content did not match the expected query subject pattern."
+                    if strategy.get("mode") in {"search", "search_input"}:
+                        page1_hydrated = bool(probe.get("page1_hydrated", True))
+                        page1_zero_row_ambiguous = bool(probe.get("page1_zero_row_ambiguous", False))
+                        if page1_zero_row_ambiguous and int(probe.get("page1_rows") or 0) <= 0:
+                            attempt["search_applied"] = False
+                            attempt["search_validation"] = {
+                                "mode": "inconclusive_zero_row_ui",
+                                "reason": "Gmail search view returned 0 rows while shell UI was present; row hydration may have failed.",
+                                "probe": probe,
+                            }
+                            inconclusive_warning = (
+                                f"{strategy.get('name')}: Gmail search validity was inconclusive because the UI shell loaded but row hydration stayed at 0 rows."
+                            )
+                            if inconclusive_warning not in fallback_warnings:
+                                fallback_warnings.append(inconclusive_warning)
+                            emit_checkpoint(
+                                "attempt_search_inconclusive_zero_rows",
+                                {"current_attempt": attempt.get("name"), "search_row_probe": probe},
+                            )
+                            continue
+                        looks_valid = _search_results_content_looks_valid(
+                            strategy_name=str(strategy.get("name") or ""),
+                            page1_rows=int(probe.get("page1_rows") or 0),
+                            page1_exact_hits=int(probe.get("page1_exact_subject_hits") or 0),
+                            page1_broad_hits=int(probe.get("page1_broad_subject_hits") or 0),
+                            page1_hydrated=page1_hydrated,
+                            page1_zero_row_ambiguous=page1_zero_row_ambiguous,
                         )
-                        if mismatch_warning not in fallback_warnings:
-                            fallback_warnings.append(mismatch_warning)
-                        emit_checkpoint(
-                            "attempt_content_mismatch",
-                            {"current_attempt": attempt.get("name"), "search_row_probe": probe},
-                        )
-                        continue
+                        if not looks_valid:
+                            attempt["content_mismatch"] = True
+                            attempt["search_applied"] = False
+                            attempt["search_validation"] = {
+                                "mode": "invalid_content_mismatch",
+                                "reason": "Gmail URL looked like search mode, but first-page rows did not match the expected subject pattern.",
+                                "probe": probe,
+                            }
+                            mismatch_warning = (
+                                f"{strategy.get('name')}: Gmail URL looked like search mode, but first-page row content did not match the expected query subject pattern."
+                            )
+                            if mismatch_warning not in fallback_warnings:
+                                fallback_warnings.append(mismatch_warning)
+                            emit_checkpoint(
+                                "attempt_content_mismatch",
+                                {"current_attempt": attempt.get("name"), "search_row_probe": probe},
+                            )
+                            continue
+                        attempt["search_validation"] = {
+                            "mode": "valid",
+                            "reason": "",
+                            "probe": probe,
+                        }
 
                     all_candidates.extend(scan.get("candidates", []))
                     emit_checkpoint(
@@ -1770,6 +2104,8 @@ def main() -> None:
                 max_rows=args.max_rows,
                 max_pages=args.max_pages,
                 date_window_days=args.date_window_days,
+                row_hydration_timeout_ms=args.row_hydration_timeout_ms,
+                zero_row_retries=args.zero_row_retries,
                 include_body=args.include_body,
                 verbose=args.verbose,
                 checkpoint_path=(

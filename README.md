@@ -10,12 +10,15 @@
 - DOI normalization + duplicate-safe Notion payload planning.
 - Structured diagnostics for reproducible runs (`search_ladder`, `attempts`, warnings).
 
-## Recent Improvements (unreleased / post-v0.1.4)
+## Recent Improvements (unreleased / post-v0.1.5)
 
-- `find_gmail_message.py` now supports date-only matching via `--received-on YYYY-MM-DD` (subject + sender validation still applies).
-- Gmail Playwright fallback now emits phase checkpoints to `<output>.partial.json` during long runs and adds row-open retries/extraction warnings so one Gmail thread failure does not abort a strategy.
-- `verify_publisher_record.mjs` adds an automatic Wiley challenge fallback ladder for headless runs: headless -> local CDP attach (if available) -> headed retry (manual challenge-clear window), reported in `fallbackRuns`.
-- Workflow guidance now recommends duplicate prechecks (exact/normalized DOI) before expensive publisher verification when possible, then a final dedupe gate before Notion writes.
+- Gmail helper adds list-row hydration retries and diagnostics (`ui_probe`, `list_hydration`) to avoid false `0`-row misses when the Gmail shell renders before message rows attach.
+- Gmail search validation now treats shell-present + `0` rows as an inconclusive UI state (not a trustworthy empty search) and can refresh the view once before downgrading a strategy.
+- `find_gmail_message.py` adds `--row-hydration-timeout-ms` and `--zero-row-retries` for tuning Gmail row hydration behavior.
+- `verify_publisher_record.mjs` adds explicit Springer Link (`link.springer.com`) policy support and Springernature tracker-host support for `links.springernature.com`.
+- Verifier article-type classification now uses publisher raw-type precedence and emits trace fields (`articleTypeClassificationSource`, `articleTypeMatchedHint`) so Springer `Original Paper` is not misclassified by title heuristics (for example `Perspective`).
+- Added Springer fixture regression tests and Python unit tests for Gmail helper hydration/search-validation logic.
+- Validated live against a Journal of Business Ethics ToC alert (Feb 24, 2026, 4:09 PM) without manual Gmail probing or manual Springer article-type normalization.
 
 ## Recent Improvements (v0.1.3)
 
@@ -124,13 +127,19 @@ Recommended order for large alerts:
 
 ## Testing
 
-Run local parser regression tests (AOM/Atypon fixtures):
+Run local parser regression tests (AOM/Atypon, Wiley, Springer fixtures):
 
 ```bash
 npm test
 ```
 
-These tests validate recent parser improvements, including AOM journal inference and APA author formatting cleanup.
+Run Gmail helper logic unit tests:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_find_gmail_message_helpers.py'
+```
+
+These tests validate recent parser improvements plus Gmail zero-row hydration/search-validation decision logic.
 
 ## Troubleshooting
 
@@ -138,8 +147,10 @@ These tests validate recent parser improvements, including AOM journal inference
   Gmail may display/store a subject with a trailing period while the copied subject omits it. The Gmail helper now normalizes trailing punctuation, but keep the received timestamp for exact targeting.
 - Gmail search appears to stay in Inbox:
   The helper already validates search-state and downgrades strategy when Gmail silently fails a query route. Review `attempts` diagnostics in the JSON output.
+- Gmail helper shows `0` rows but the email exists:
+  Inspect `attempts[*].ui_probe` and `attempts[*].list_hydration` (and `<output>.partial.json` if present). The helper now retries row hydration and may refresh the view once before downgrading a search/crawl attempt.
 - Gmail helper looks stalled during a long Playwright run:
-  If `--output` is set, inspect `<output>.partial.json` to see the latest phase (`candidate_row_match`, `candidate_opened`, `candidate_extracted`) and current strategy.
+  If `--output` is set, inspect `<output>.partial.json` to see the latest phase (`list_hydration_*`, `candidate_row_match`, `candidate_opened`, `candidate_extracted`) and current strategy.
 - Protected publisher pages (Cloudflare / anti-bot):
   Prefer running with a normal authenticated Chrome session and attach via `--cdp-url` when verification is blocked.
 - Wiley / SMJ challenge in headless verification:

@@ -41,9 +41,11 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Supports pagination via `--max-pages` and relaxed date fallback via `--date-window-days`.
    - Supports date-only requests with `--received-on YYYY-MM-DD` (matches any time on that date; still validates subject and optional sender).
    - Uses hardened Gmail `Older` pagination selectors/click fallbacks and emits warnings when page-1 results are likely truncated (for example exactly `--max-rows` rows but no usable `Older` control).
+   - Adds Gmail list-row hydration detection/retries (`--row-hydration-timeout-ms`, `--zero-row-retries`) to avoid false 0-row misses when the Gmail shell renders before message rows attach.
    - Handles Gmail localized timestamp formats (including narrow-space AM/PM strings).
    - Supports cross-domain Google cookie loading (`.google.com`, `mail.google.com`, `accounts.google.com`) and direct cookie injection for fallback.
    - Emits structured diagnostics (`search_ladder`, `attempts`, sampled rows, selected strategy, warnings).
+   - Records Gmail UI row probes (`ui_probe`) and per-attempt list hydration diagnostics (`list_hydration`) to explain dynamic Gmail 0-row states and retry/refresh behavior.
    - Emits phase progress checkpoints during long Playwright runs (for example candidate row/open/extract phases) to `<output>.partial.json` when `--output` is set.
    - Adds row-open retries and extraction-phase warnings so a single Gmail thread/render failure does not abort an entire strategy attempt.
    - Filters alert-management links at extraction time (`unsubscribe`, `removeAlert`, manage-alert/preferences anchors) so `links` and `link_details` are safe verification candidates by default.
@@ -54,11 +56,13 @@ Use these scripts under `scripts/` to standardize the workflow:
      - Python Playwright only when using `--session-fallback` (`uv pip install playwright`)
 2. `scripts/verify_publisher_record.mjs`
    - Verifies metadata from publisher pages with domain policy and challenge detection/retries.
-   - Resolves tracked email links (for example `click.skem1.com`, `el.aom.org`, `el.wiley.com`) to final article URLs before verification.
+   - Resolves tracked email links (for example `click.skem1.com`, `el.aom.org`, `el.wiley.com`, `links.springernature.com`) to final article URLs before verification.
    - Re-evaluates domain policy after browser navigation/redirects (for example DOI -> Wiley final URL) so publisher-specific selectors still apply on the actual article page.
+   - Includes explicit Springer Link (`link.springer.com`) policy selectors and Springer non-article link exclusions (issue/TOC/journal-home/email utility paths).
    - Includes AOM/Atypon (`journals.aom.org`) metadata extraction support using `dc.*` tags + DOM fallbacks (journal breadcrumb, online date, article type).
    - Strips academic honorifics (for example `Dr.`, `Professor`) before APA author formatting.
    - Chooses the best abstract candidate across DOM + meta tags, penalizing truncated teaser snippets (for example `...`) and common issue/TOC prompts.
+   - Uses source-aware article-type classification with publisher raw-type precedence (for example Springer `Original Paper` remains `research-article` even if the title contains words like `Perspective`).
    - Accepts either a link-list JSON or the full `find_gmail_message.py` `*_match.json` output (`candidates[*]`) as verifier input.
    - Applies a hard pre-navigation guard for alert-management links (`unsubscribe`, `removeAlert`, manage-alert/preferences) before any browser navigation.
    - Applies a hard pre-navigation guard for unsupported URL schemes (for example `mailto:`) before any browser navigation.
@@ -72,7 +76,7 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Waits/polls for Cloudflare challenge pages to clear before failing on browser paths.
    - In `--cdp-url` mode, reuses the existing Chrome profile context (instead of always creating a fresh context) for better challenge/cookie carryover.
    - Automatically retries Wiley challenge-blocked URLs with a fallback ladder when the initial run is headless: headless -> local CDP attach (if available) -> headed Chrome retry (manual challenge-clear window), and records fallback metadata in `fallbackRuns`.
-   - Emits normalized `articleType`, `ingestDecision`, and `ingestReason` for policy-safe ingestion.
+   - Emits normalized `articleType`, `ingestDecision`, and `ingestReason` for policy-safe ingestion, plus trace fields (`articleTypeClassificationSource`, `articleTypeMatchedHint`) for auditability.
    - Dependency:
      - Node Playwright (`npm i playwright`) or `playwright-core`
 3. `scripts/build_notion_payload.py`
@@ -81,9 +85,9 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Supports strict duplicate mode with `--require-existing`.
    - Accepts existing Notion view payload from stdin (`--existing -` or `--existing-stdin`) and can save it locally with `--save-existing` for reproducible duplicate-safe reruns.
 
-### Local Regression Tests (AOM/Atypon Fixtures)
+### Local Regression Tests (AOM/Atypon, Wiley, Springer Fixtures)
 
-- Redacted AOM/Atypon HTML fixtures live under `tests/fixtures/`.
+- Redacted AOM/Atypon, Wiley, and Springer HTML fixtures live under `tests/fixtures/`.
 - Run parser regression checks with:
 
 ```bash
@@ -211,7 +215,9 @@ Use this escalation path; stop at the first reliable method.
 - Prefer resilient selectors (`role`, `aria-label`, semantic landmarks) over brittle class names.
 - Wait for stable render (`networkidle` plus explicit content checks).
 - Prefer concrete Gmail surface readiness checks (rows/message header/search input) before `networkidle`; use `networkidle` only as a short fallback because Gmail often keeps background requests alive.
+- If Gmail search/crawl shows `0` rows while the shell/search UI is present, use the helper’s hydration retry diagnostics (`ui_probe`, `list_hydration`) before concluding the email is missing.
 - For long-running scans, inspect `<output>.partial.json` to see the latest phase (`candidate_row_match`, `candidate_opened`, `candidate_extracted`) before killing/retrying the run.
+- New partial-checkpoint phases may include `list_hydration_probe`, `list_hydration_retry`, `list_hydration_recovered`, and `list_hydration_failed` when Gmail rows are delayed.
 - Validate search state using row-content heuristics (not URL state alone) when Gmail appears to keep inbox-like rows under a `#search/...` URL.
 - Treat `page 1 returned <max_rows> rows but no usable Older control` as a likely pagination truncation warning and downgrade strategy/fallback accordingly.
 - If needed, switch between hash-route search and search-input (`Enter`) fallback mode.
@@ -230,6 +236,7 @@ Use this escalation path; stop at the first reliable method.
 - For protected domains (often INFORMS, SAGE, Wiley), default to browser-rendered extraction.
 - When source links are DOI/tracking URLs, derive extraction policy from the navigated final page URL (not only the original URL) so Wiley/Atypon/etc. abstract selectors are applied correctly.
 - For AOM/Atypon (`journals.aom.org`), treat as protected and prefer browser extraction (CDP-attached Chrome when available). The pages often expose `dc.*` metadata that is sufficient for accurate journal/year/article-type extraction once rendered.
+- For Springer Link (`link.springer.com`), treat as protected and trust publisher raw types such as `Original Paper` as the primary article-type signal (before title keyword heuristics).
 - For ScienceDirect links, default to the script’s curl-first path (`--sciencedirect-mode auto`) and only fall back to browser when required metadata is incomplete.
 - For Oxford Academic (`academic.oup.com`), treat as protected and expect a temporary Cloudflare interstitial.
 

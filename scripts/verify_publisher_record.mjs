@@ -10,6 +10,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { execFile } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_RETRIES = 3;
@@ -52,6 +53,20 @@ const DOMAIN_POLICIES = [
     hostPattern: /(^|\.)onlinelibrary\.wiley\.com$/i,
     protected: true,
     abstractSelectors: ["section.article-section__abstract", "section.abstract", "#abstract"],
+  },
+  {
+    name: "springer_link",
+    hostPattern: /(^|\.)link\.springer\.com$/i,
+    protected: true,
+    abstractSelectors: [
+      "section#Abs1",
+      "section.Abstract",
+      ".Abstract",
+      'section.c-article-section[id^="Abs"]',
+      "#Abs1-content",
+      "section.abstract",
+      "#abstract",
+    ],
   },
   {
     name: "sciencedirect",
@@ -112,6 +127,7 @@ const TRACKING_HOST_PATTERNS = [
   /(^|\.)el\.wiley\.com$/i,
   /(^|\.)click\.skem1\.com$/i,
   /(^|\.)lnk\.springernature\.com$/i,
+  /(^|\.)links\.springernature\.com$/i,
   /(^|\.)link\.mail\.elsevier\.com$/i,
   /(^|\.)click\.notification\.elsevier\.com$/i,
 ];
@@ -139,6 +155,13 @@ const EXCLUDE_ARTICLE_TYPES = new Set([
   "announcement",
   "news",
 ]);
+
+const POLICY_ARTICLE_TYPE_OVERRIDES = {
+  springer_link: [
+    { pattern: /\boriginal\s*paper\b/i, normalized: "research-article" },
+    { pattern: /\boriginal\s*article\b/i, normalized: "research-article" },
+  ],
+};
 
 function usage() {
   const script = path.basename(process.argv[1] || "verify_publisher_record.mjs");
@@ -491,6 +514,37 @@ function classifyKnownNonArticleLink(rawUrl) {
         return "wiley_marketing_or_home_link";
       }
     }
+    if (/(^|\.)link\.springer\.com$/.test(host)) {
+      if (/^\/article\//i.test(pathName)) {
+        return null;
+      }
+      if (/^\/content\/pdf\//i.test(pathName) || /^\/content\/html\//i.test(pathName)) {
+        return "springer_article_asset_link";
+      }
+      if (/^\/journal\//i.test(pathName)) {
+        if (/\/volumes-and-issues(\/|$)/i.test(pathName)) {
+          return "springer_toc_or_issue_link";
+        }
+        return "springer_journal_home_link";
+      }
+      if (/^\/search/i.test(pathName) || /^\/collections\//i.test(pathName)) {
+        return "springer_navigation_or_collection_link";
+      }
+      if (/^\/account\//i.test(pathName) || /^\/myaccount\//i.test(pathName)) {
+        return "springer_account_or_preferences_link";
+      }
+      if (u.searchParams.has("error") || u.searchParams.has("code")) {
+        return "springer_email_webview_link";
+      }
+      if (pathName === "/" || pathName === "") {
+        return "springer_marketing_or_home_link";
+      }
+    }
+    if (/(^|\.)mail\.google\.com$/.test(host)) {
+      if (u.searchParams.get("view") === "lg" && u.searchParams.has("permmsgid")) {
+        return "gmail_message_webview_link";
+      }
+    }
     if (/(^|\.)atypon\.com$/.test(host)) return "technology_partner_link";
     return null;
   } catch {
@@ -700,41 +754,84 @@ function requiredMissing(record) {
   return required.filter((key) => isNotVerifiedValue(record[key]));
 }
 
-function normalizeArticleTypeValue(value) {
+function normalizeArticleTypeValue(value, { policyName = "", allowPolicyOverrides = false } = {}) {
   const text = cleanText(value).toLowerCase();
-  if (!text) return "";
+  if (!text) return { normalized: "", matchedHint: "" };
 
-  if (/\beditorial\s*(board|data)\b/i.test(text)) return "announcement";
-  if (/(book\s*review|media\s*review)/i.test(text)) return "book-review";
-  if (/\b(editorial|from the editors?)\b/i.test(text)) return "editorial";
-  if (/\bdiscussion\b/i.test(text)) return "discussion";
-  if (/\b(commentary|perspective|opinion)\b/i.test(text)) return "commentary";
-  if (/\b(corrigendum|corrigenda)\b/i.test(text)) return "corrigendum";
-  if (/\b(erratum|errata)\b/i.test(text)) return "erratum";
-  if (/\b(retraction|withdrawal)\b/i.test(text)) return "retraction";
-  if (/\binterview\b/i.test(text)) return "interview";
-  if (/\bcall\s*for\s*papers?\b/i.test(text)) return "call-for-papers";
-  if (/\b(announcement|announcements)\b/i.test(text)) return "announcement";
-  if (/\bnews\b/i.test(text)) return "news";
-  if (/\b(research\s*paper|research\s*article|original\s*article)\b/i.test(text)) {
-    return "research-article";
+  if (allowPolicyOverrides) {
+    const overrides = POLICY_ARTICLE_TYPE_OVERRIDES[String(policyName || "").toLowerCase()] || [];
+    for (const override of overrides) {
+      if (override.pattern.test(text)) {
+        return {
+          normalized: override.normalized,
+          matchedHint: cleanText(value),
+        };
+      }
+    }
   }
-  if (/\b(scholarlyarticle|journalarticle)\b/i.test(text)) return "research-article";
-  if (/\barticle\b/i.test(text)) return "research-article";
-  return "";
+
+  if (/\beditorial\s*(board|data)\b/i.test(text)) return { normalized: "announcement", matchedHint: cleanText(value) };
+  if (/(book\s*review|media\s*review)/i.test(text)) return { normalized: "book-review", matchedHint: cleanText(value) };
+  if (/\b(editorial|from the editors?)\b/i.test(text)) return { normalized: "editorial", matchedHint: cleanText(value) };
+  if (/\bdiscussion\b/i.test(text)) return { normalized: "discussion", matchedHint: cleanText(value) };
+  if (/\b(commentary|perspective|opinion)\b/i.test(text)) return { normalized: "commentary", matchedHint: cleanText(value) };
+  if (/\b(corrigendum|corrigenda)\b/i.test(text)) return { normalized: "corrigendum", matchedHint: cleanText(value) };
+  if (/\b(erratum|errata)\b/i.test(text)) return { normalized: "erratum", matchedHint: cleanText(value) };
+  if (/\b(retraction|withdrawal)\b/i.test(text)) return { normalized: "retraction", matchedHint: cleanText(value) };
+  if (/\binterview\b/i.test(text)) return { normalized: "interview", matchedHint: cleanText(value) };
+  if (/\bcall\s*for\s*papers?\b/i.test(text)) return { normalized: "call-for-papers", matchedHint: cleanText(value) };
+  if (/\b(announcement|announcements)\b/i.test(text)) return { normalized: "announcement", matchedHint: cleanText(value) };
+  if (/\bnews\b/i.test(text)) return { normalized: "news", matchedHint: cleanText(value) };
+  if (/\b(research\s*paper|research\s*article|original\s*article)\b/i.test(text)) {
+    return { normalized: "research-article", matchedHint: cleanText(value) };
+  }
+  if (/\b(scholarlyarticle|journalarticle)\b/i.test(text)) {
+    return { normalized: "research-article", matchedHint: cleanText(value) };
+  }
+  if (/\barticle\b/i.test(text)) return { normalized: "research-article", matchedHint: cleanText(value) };
+  return { normalized: "", matchedHint: "" };
 }
 
-function classifyArticleType({ typeHints, title, pageTitle }) {
-  const hintValues = uniqueStrings(typeHints || []);
-  const fallbackValues = uniqueStrings([title, pageTitle]);
-  for (const source of [...hintValues, ...fallbackValues]) {
-    const normalized = normalizeArticleTypeValue(source);
-    if (!normalized) continue;
+function classifyArticleType({ policyName = "", rawTypeHints = [], semanticHints = [] }) {
+  const seen = new Set();
+  const rawHints = [];
+  for (const hint of rawTypeHints || []) {
+    if (!hint) continue;
+    const value = cleanText(hint.value ?? hint);
+    if (!value) continue;
+    const sourceLabel = cleanText(hint.sourceLabel || "publisher_raw_type") || "publisher_raw_type";
+    const key = `${sourceLabel}\u0000${value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rawHints.push({ value, sourceLabel });
+  }
+
+  const semanticHintList = [];
+  for (const hint of semanticHints || []) {
+    if (!hint) continue;
+    const value = cleanText(hint.value ?? hint);
+    if (!value) continue;
+    const sourceLabel = cleanText(hint.sourceLabel || "title_heuristic") || "title_heuristic";
+    const key = `${sourceLabel}\u0000${value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    semanticHintList.push({ value, sourceLabel });
+  }
+
+  const classifyOne = (hint, allowPolicyOverrides) => {
+    const normalizedResult = normalizeArticleTypeValue(hint.value, {
+      policyName,
+      allowPolicyOverrides,
+    });
+    const normalized = normalizedResult.normalized;
+    if (!normalized) return null;
     if (EXCLUDE_ARTICLE_TYPES.has(normalized)) {
       return {
         articleType: normalized,
         ingestDecision: "exclude",
         ingestReason: `excluded_by_type:${normalized}`,
+        articleTypeClassificationSource: hint.sourceLabel,
+        articleTypeMatchedHint: normalizedResult.matchedHint || hint.value,
       };
     }
     if (INCLUDE_ARTICLE_TYPES.has(normalized)) {
@@ -742,14 +839,47 @@ function classifyArticleType({ typeHints, title, pageTitle }) {
         articleType: normalized,
         ingestDecision: "include",
         ingestReason: `included_by_type:${normalized}`,
+        articleTypeClassificationSource: hint.sourceLabel,
+        articleTypeMatchedHint: normalizedResult.matchedHint || hint.value,
       };
     }
+    return null;
+  };
+
+  for (const hint of rawHints) {
+    const classified = classifyOne(hint, true);
+    if (classified) return classified;
   }
+
+  for (const hint of semanticHintList) {
+    const classified = classifyOne(hint, false);
+    if (classified) return classified;
+  }
+
   return {
     articleType: "[Not verified]",
     ingestDecision: "not_verified",
-    ingestReason: "article_type_unclear",
+    ingestReason: rawHints.length ? "article_type_unmapped_raw_hint" : "article_type_unclear",
+    articleTypeClassificationSource: "none",
+    articleTypeMatchedHint: rawHints[0]?.value || "",
   };
+}
+
+function logArticleTypeDecision(record, sourceUrl, verbose) {
+  if (!verbose || !record) return;
+  log(
+    [
+      "ArticleType",
+      `url=${sourceUrl || record.sourceUrl || ""}`,
+      `raw=${JSON.stringify(record.articleTypeRaw || "")}`,
+      `source=${record.articleTypeClassificationSource || "none"}`,
+      `matched=${JSON.stringify(record.articleTypeMatchedHint || "")}`,
+      `articleType=${record.articleType || ""}`,
+      `decision=${record.ingestDecision || ""}`,
+      `reason=${record.ingestReason || ""}`,
+    ].join(" | "),
+    verbose
+  );
 }
 
 async function sleep(ms) {
@@ -1366,7 +1496,7 @@ async function waitForChallengeClear(page, args, verbose) {
   };
 }
 
-function buildRecordFromExtracted(extracted, sourceUrl) {
+function buildRecordFromExtracted(extracted, sourceUrl, policyName = "") {
   const doiUrl =
     normalizeDoi(extracted?.doiMeta) ||
     normalizeDoi(extractDoiFromText(extracted?.finalUrl || "")) ||
@@ -1400,15 +1530,26 @@ function buildRecordFromExtracted(extracted, sourceUrl) {
     articleType: "[Not verified]",
     ingestDecision: "not_verified",
     ingestReason: "article_type_unclear",
+    articleTypeClassificationSource: "none",
+    articleTypeMatchedHint: "",
   };
   const classification = classifyArticleType({
-    typeHints: [extracted?.articleTypeHint, extracted?.pageTitle],
-    title: extracted?.title,
-    pageTitle: extracted?.pageTitle,
+    policyName,
+    rawTypeHints: [
+      { value: extracted?.articleTypeMetaHint, sourceLabel: "publisher_raw_type" },
+      { value: extracted?.articleTypeDomHint, sourceLabel: "publisher_dom_type" },
+      { value: extracted?.articleTypeJsonLdHint, sourceLabel: "publisher_jsonld_type" },
+    ],
+    semanticHints: [
+      { value: extracted?.title, sourceLabel: "title_heuristic" },
+      { value: extracted?.pageTitle, sourceLabel: "page_title_heuristic" },
+    ],
   });
   normalized.articleType = classification.articleType;
   normalized.ingestDecision = classification.ingestDecision;
   normalized.ingestReason = classification.ingestReason;
+  normalized.articleTypeClassificationSource = classification.articleTypeClassificationSource || "none";
+  normalized.articleTypeMatchedHint = classification.articleTypeMatchedHint || "";
   normalized.citation = buildApaCitation(normalized);
   normalized.missingFields = requiredMissing(normalized);
   normalized.status = normalized.missingFields.length ? "not_verified" : "verified";
@@ -1635,12 +1776,15 @@ async function extractMetadata(page, sourceUrl, policy) {
       pageRange,
       doiMeta,
       abstractText,
+      articleTypeMetaHint: articleTypeFromMeta || "",
+      articleTypeDomHint: articleTypeFromDom || "",
+      articleTypeJsonLdHint: jsonLdType || "",
       articleTypeHint: articleTypeFromMeta || articleTypeFromDom || jsonLdType || "",
       finalUrl: window.location.href,
       pageTitle: document.title || "",
     };
   }, selectors);
-  return buildRecordFromExtracted(extracted, sourceUrl);
+  return buildRecordFromExtracted(extracted, sourceUrl, policy?.name || "");
 }
 
 function challengeError(message, details) {
@@ -1671,6 +1815,8 @@ function buildVerificationFailureRecord(inputUrl, policy, errors) {
     articleType: "[Not verified]",
     ingestDecision: "not_verified",
     ingestReason: "verification_failed",
+    articleTypeClassificationSource: "none",
+    articleTypeMatchedHint: "",
     policy: {
       name: policy?.name || "default",
       protected: Boolean(policy?.protected),
@@ -1779,6 +1925,8 @@ function buildExcludedLinkRecord(inputUrl, finalUrl, policy, reason, resolvedTra
     articleType: "announcement",
     ingestDecision: "exclude",
     ingestReason: reason || "non_article_link",
+    articleTypeClassificationSource: "none",
+    articleTypeMatchedHint: "",
     policy: {
       name: policy?.name || "default",
       protected: Boolean(policy?.protected),
@@ -1817,7 +1965,7 @@ async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolved
         sourceUrl,
         fetched.effectiveUrl || fetchTarget
       );
-      const record = buildRecordFromExtracted(extracted, sourceUrl);
+      const record = buildRecordFromExtracted(extracted, sourceUrl, policy?.name || "");
       record.policy = {
         name: policy.name,
         protected: Boolean(policy.protected),
@@ -1836,6 +1984,7 @@ async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolved
         statusCode: Number.isFinite(fetched.statusCode) ? fetched.statusCode : null,
       };
       record.verifiedAt = new Date().toISOString();
+      logArticleTypeDecision(record, sourceUrl, args.verbose);
       return { ok: true, record, errors };
     } catch (error) {
       errors.push({
@@ -2055,6 +2204,7 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
         record.navigationResolved = Boolean(
           navigatedUrl && normalizeFinalUrlForRunDedupe(navigatedUrl) !== normalizeFinalUrlForRunDedupe(targetUrl)
         );
+        logArticleTypeDecision(record, inputUrl, args.verbose);
         rememberFinalUrl(seenFinalUrls, record.resolvedUrl || record.finalUrl || navigatedUrl || targetUrl);
         await page.close();
         return { ok: true, record };
@@ -2247,7 +2397,19 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`Error: ${error.message || error}\n`);
-  process.exit(1);
-});
+export { classifyArticleType, classifyKnownNonArticleLink, isTrackingUrl, normalizeArticleTypeValue };
+
+const IS_MAIN = (() => {
+  try {
+    return Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (IS_MAIN) {
+  main().catch((error) => {
+    process.stderr.write(`Error: ${error.message || error}\n`);
+    process.exit(1);
+  });
+}
