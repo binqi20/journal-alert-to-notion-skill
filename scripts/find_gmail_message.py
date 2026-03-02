@@ -333,6 +333,25 @@ def _normalize_subject_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _unwrap_subject_prefixes(value: str | None) -> dict[str, Any]:
+    raw = _normalize_subject_text(value)
+    prefixes: list[str] = []
+    current = raw
+    while True:
+        matched = re.match(r"^(fw|fwd|re)\s*:\s*(.+)$", current, flags=re.IGNORECASE)
+        if not matched:
+            break
+        prefixes.append(matched.group(1).lower())
+        current = _normalize_subject_text(matched.group(2))
+    return {
+        "raw": raw,
+        "normalized": current or raw,
+        "prefixes": prefixes,
+        "is_forwarded": any(prefix in {"fw", "fwd"} for prefix in prefixes),
+        "has_reply_prefix": any(prefix == "re" for prefix in prefixes),
+    }
+
+
 def _strip_terminal_subject_punctuation(value: str) -> str:
     return re.sub(r"[\s.!?。！？…]+$", "", value).strip()
 
@@ -369,6 +388,62 @@ def _subject_probe_matches(observed: str | None, requested: str) -> tuple[bool, 
 
 def _normalize_link_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip().lower()
+
+
+def _extract_forwarded_metadata(body_text: str | None, fallback_tz: dt.tzinfo) -> dict[str, Any]:
+    text = (body_text or "").strip()
+    result: dict[str, Any] = {
+        "original_sender": "",
+        "original_sender_name": "",
+        "original_sender_email": "",
+        "original_subject": "",
+        "original_date_raw": "",
+        "original_date_local": "",
+        "forwarded_body_extracted": False,
+    }
+    if not text:
+        return result
+
+    lines = [line.strip() for line in text.splitlines()]
+    header_candidates: dict[str, str] = {}
+    started = False
+    header_lines_seen = 0
+    for line in lines[:120]:
+        if not line:
+            if started and header_lines_seen >= 2:
+                break
+            continue
+        matched = re.match(r"^(from|sent|date|subject|to)\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if matched:
+            started = True
+            header_lines_seen += 1
+            header_candidates[matched.group(1).lower()] = matched.group(2).strip()
+            continue
+        if started and header_lines_seen >= 2:
+            break
+
+    sender_raw = header_candidates.get("from") or ""
+    if sender_raw:
+        sender_name, sender_email = email.utils.parseaddr(sender_raw)
+        result["original_sender"] = sender_raw
+        result["original_sender_name"] = sender_name.strip()
+        result["original_sender_email"] = sender_email.strip()
+    subject_raw = header_candidates.get("subject") or ""
+    if subject_raw:
+        result["original_subject"] = _normalize_subject_text(subject_raw)
+    date_raw = header_candidates.get("date") or header_candidates.get("sent") or ""
+    if date_raw:
+        result["original_date_raw"] = date_raw
+        parsed_date = _parse_gmail_datetime(date_raw, fallback_tz) or _parse_maybe_received_datetime(
+            date_raw, fallback_tz
+        )
+        if parsed_date is not None:
+            result["original_date_local"] = parsed_date.astimezone(fallback_tz).isoformat()
+
+    result["forwarded_body_extracted"] = bool(
+        result["original_sender"] or result["original_subject"] or result["original_date_raw"]
+    )
+    return result
 
 
 def _alert_management_link_reason(*, href: str | None, text: str | None) -> str | None:
@@ -426,6 +501,80 @@ def _blocked_link_reason(*, href: str | None, text: str | None) -> str | None:
 
 def _is_alert_management_link(*, href: str | None, text: str | None) -> bool:
     return _alert_management_link_reason(href=href, text=text) is not None
+
+
+def _infer_candidate_kind(*, href: str | None, text: str | None, blocked_reason: str | None) -> str:
+    href_norm = _normalize_link_href(href).lower()
+    text_norm = _normalize_link_text(text)
+    if blocked_reason:
+        return "blocked"
+    if _is_gmail_full_message_webview_link(href):
+        return "webview"
+    if text_norm.startswith("http://") or text_norm.startswith("https://"):
+        if "onlinelibrary.wiley.com" in text_norm or "sms.onlinelibrary.wiley.com" in text_norm:
+            return "journal_home"
+        return "marketing"
+    if "/toc/" in href_norm or re.search(r"\b(table of contents|toc|early view|issue information)\b", text_norm):
+        return "toc_like"
+    if "/journal/" in href_norm or re.search(r"\bjournal home\b", text_norm):
+        return "journal_home"
+    if (
+        href_norm.endswith("wiley.com/")
+        or "/?campaign=" in href_norm
+        or re.search(r"\b(view entire message|wiley online library)\b", text_norm)
+    ):
+        return "marketing"
+    if (
+        "/doi/" in href_norm
+        or "/article/" in href_norm
+        or re.search(r"\b10\.\d{4,9}/", href_norm)
+        or (
+            text_norm
+            and len(re.findall(r"[a-zA-Z0-9]+", text_norm)) >= 5
+            and not re.search(r"\b(early view|click here|full text|abstract|pdf)\b", text_norm)
+        )
+    ):
+        return "article_like"
+    return "generic_safe"
+
+
+def _infer_link_source_context(
+    *,
+    href: str | None,
+    text: str | None,
+    blocked_reason: str | None,
+    candidate_kind: str,
+    message_kind: str,
+    base_source: str | None = None,
+) -> str:
+    if base_source:
+        return base_source
+    if blocked_reason in {"alert_unsubscribe_link", "alert_management_preferences_link"}:
+        return "footer"
+    if blocked_reason == "unsupported_url_scheme":
+        return "wrapper_header"
+    if candidate_kind in {"toc_like", "journal_home", "marketing"}:
+        return "footer"
+    if message_kind == "forwarded":
+        return "forwarded_body"
+    return "gmail_thread"
+
+
+def _candidate_score(candidate_kind: str, source_context: str) -> int:
+    base = {
+        "article_like": 100,
+        "generic_safe": 55,
+        "toc_like": 30,
+        "journal_home": 20,
+        "marketing": 10,
+        "webview": 5,
+        "blocked": 0,
+    }.get(candidate_kind, 0)
+    if source_context == "forwarded_body":
+        base += 5
+    if source_context == "webview_expansion":
+        base += 2
+    return base
 
 
 def _build_search_query(
@@ -786,6 +935,13 @@ def _parse_gmail_datetime(value: str, fallback_tz: dt.tzinfo) -> dt.datetime | N
     return None
 
 
+def _parse_maybe_received_datetime(value: str, fallback_tz: dt.tzinfo) -> dt.datetime | None:
+    try:
+        return _parse_received_datetime(value, fallback_tz)
+    except SystemExit:
+        return None
+
+
 def _safe_inner_text(locator: Any) -> str:
     try:
         return locator.inner_text(timeout=2000).strip()
@@ -874,8 +1030,48 @@ def _merge_link_details(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
             if key in seen:
                 continue
             seen.add(key)
-            merged.append({"href": href, "text": text})
+            normalized_item = dict(item)
+            normalized_item["href"] = href
+            normalized_item["text"] = text
+            merged.append(normalized_item)
     return merged
+
+
+def _enrich_link_details(
+    link_details: list[dict[str, Any]],
+    *,
+    message_kind: str,
+) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for item in link_details:
+        if not isinstance(item, dict):
+            continue
+        href = _normalize_link_href(item.get("href"))
+        text = str(item.get("text") or "").strip()
+        if not href:
+            continue
+        blocked_reason = _blocked_link_reason(href=href, text=text)
+        candidate_kind = _infer_candidate_kind(
+            href=href,
+            text=text,
+            blocked_reason=blocked_reason,
+        )
+        source_context = _infer_link_source_context(
+            href=href,
+            text=text,
+            blocked_reason=blocked_reason,
+            candidate_kind=candidate_kind,
+            message_kind=message_kind,
+            base_source=str(item.get("sourceContext") or "").strip() or None,
+        )
+        enriched_item = dict(item)
+        enriched_item["href"] = href
+        enriched_item["text"] = text
+        enriched_item["sourceContext"] = source_context
+        enriched_item["candidateKind"] = candidate_kind
+        enriched_item["candidateScore"] = _candidate_score(candidate_kind, source_context)
+        enriched.append(enriched_item)
+    return enriched
 
 
 def _expand_gmail_webview_message(
@@ -908,6 +1104,8 @@ def _expand_gmail_webview_message(
         except Exception:
             _log("Gmail webview body selector wait timed out; continuing.", enabled=verbose)
         link_details = _safe_link_details_any(popup)
+        for item in link_details:
+            item["sourceContext"] = "webview_expansion"
         result["all_link_count"] = len(link_details)
         result["link_details"] = link_details
         if include_body:
@@ -1331,6 +1529,7 @@ def _extract_message_candidate(
     verbose: bool = False,
 ) -> dict[str, Any]:
     message_subject = _safe_inner_text(page.locator("h2.hP").first) or row_subject
+    subject_info = _unwrap_subject_prefixes(message_subject)
     sender_chip = page.locator("span.gD").first
     sender_email = _safe_attr(sender_chip, "email")
     sender_name = _safe_attr(sender_chip, "name") or _safe_inner_text(sender_chip) or row_sender
@@ -1367,9 +1566,17 @@ def _extract_message_candidate(
         all_links = [str(item).strip() for item in all_link_details if str(item).strip()]
         all_link_details = [{"href": href, "text": ""} for href in all_links]
 
-    body_text = None
-    if include_body:
-        body_text = _safe_inner_text(page.locator("div.a3s").first)
+    body_text_probe = _safe_inner_text(page.locator("div.a3s").first)
+    body_text = body_text_probe if include_body else None
+
+    forwarded_meta = _extract_forwarded_metadata(body_text_probe, tz)
+    message_kind = (
+        "forwarded"
+        if subject_info.get("is_forwarded") or forwarded_meta.get("forwarded_body_extracted")
+        else "direct"
+    )
+    if message_kind == "forwarded" and not forwarded_meta.get("original_subject"):
+        forwarded_meta["original_subject"] = str(subject_info.get("normalized") or "")
 
     gmail_webview_expansion: dict[str, Any] | None = None
     webview_links = [
@@ -1421,21 +1628,23 @@ def _extract_message_candidate(
                 gmail_webview_expansion["body_text_length"] = len(webview_body_text)
                 gmail_webview_expansion["body_text_used"] = candidate_body_source == "gmail_webview"
 
-    blocked_link_details: list[dict[str, str]] = []
-    safe_link_details: list[dict[str, str]] = []
-    for item in all_link_details:
-        if not isinstance(item, dict):
-            continue
-        href_value = _normalize_link_href(item.get("href"))
-        text_value = str(item.get("text") or "").strip()
-        normalized = {"href": href_value, "text": text_value}
-        if not href_value:
-            continue
-        block_reason = _blocked_link_reason(href=href_value, text=text_value)
+    enriched_link_details = _enrich_link_details(all_link_details, message_kind=message_kind)
+    blocked_link_details: list[dict[str, Any]] = []
+    safe_link_details: list[dict[str, Any]] = []
+    for item in enriched_link_details:
+        block_reason = _blocked_link_reason(href=item.get("href"), text=item.get("text"))
         if block_reason:
-            blocked_link_details.append({**normalized, "reason": block_reason})
+            blocked_link_details.append({**item, "reason": block_reason})
         else:
-            safe_link_details.append(normalized)
+            safe_link_details.append(item)
+
+    safe_link_details.sort(
+        key=lambda item: (
+            -int(item.get("candidateScore") or 0),
+            str(item.get("candidateKind") or ""),
+            str(item.get("href") or ""),
+        )
+    )
 
     links = [item["href"] for item in safe_link_details]
     blocked_links = [item["href"] for item in blocked_link_details]
@@ -1446,6 +1655,9 @@ def _extract_message_candidate(
     candidate: dict[str, Any] = {
         "strategy": strategy_name,
         "subject": message_subject,
+        "subjectNormalized": str(subject_info.get("normalized") or message_subject),
+        "subjectPrefixes": list(subject_info.get("prefixes") or []),
+        "messageKind": message_kind,
         "sender_name": sender_name,
         "sender_email": sender_email,
         "sender_match": sender_match,
@@ -1458,10 +1670,24 @@ def _extract_message_candidate(
         "links": links,
         "link_details": safe_link_details,
         "all_links": all_links,
-        "all_link_details": all_link_details,
+        "all_link_details": enriched_link_details,
         "blocked_links": blocked_links,
         "blocked_link_details": blocked_link_details,
     }
+    if message_kind == "forwarded":
+        candidate["forwardedOriginalSubject"] = str(forwarded_meta.get("original_subject") or "")
+        candidate["forwardedOriginalSender"] = str(forwarded_meta.get("original_sender") or "")
+        candidate["forwardedOriginalSenderName"] = str(
+            forwarded_meta.get("original_sender_name") or ""
+        )
+        candidate["forwardedOriginalSenderEmail"] = str(
+            forwarded_meta.get("original_sender_email") or ""
+        )
+        candidate["forwardedOriginalDate"] = str(forwarded_meta.get("original_date_raw") or "")
+        candidate["forwardedOriginalDateLocal"] = str(
+            forwarded_meta.get("original_date_local") or ""
+        )
+        candidate["forwardedBodyExtracted"] = bool(forwarded_meta.get("forwarded_body_extracted"))
     if include_body:
         candidate["body_text"] = body_text
         candidate["body_text_source"] = (

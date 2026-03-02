@@ -608,6 +608,23 @@ function classifyKnownNonArticleLink(rawUrl) {
   }
 }
 
+function classifyLikelyTrackedNonArticleInput(rawUrl, linkText = "", candidateKind = "") {
+  const host = hostForUrl(rawUrl);
+  if (!/(^|\.)el\.wiley\.com$/i.test(host)) return null;
+  const kind = cleanText(candidateKind).toLowerCase();
+  const text = cleanText(linkText).toLowerCase();
+  if (kind === "toc_like" || /\b(early view|table of contents|toc|issue information)\b/.test(text)) {
+    return "wiley_toc_or_issue_link";
+  }
+  if (kind === "journal_home" || /\bjournal home\b/.test(text)) {
+    return "wiley_journal_home_link";
+  }
+  if (kind === "marketing" || /wiley online library/.test(text)) {
+    return "wiley_marketing_or_home_link";
+  }
+  return null;
+}
+
 function normalizeFinalUrlForRunDedupe(rawUrl) {
   try {
     const u = new URL(maybeCanonicalArticleUrl(rawUrl));
@@ -655,6 +672,8 @@ async function resolveTrackedUrl(inputUrl, args) {
       inputUrl,
       resolvedUrl: inputUrl,
       usedTrackingResolution: false,
+      preResolveAttempted: false,
+      preResolveSucceeded: false,
       trackingResolutionError: "",
     };
   }
@@ -690,6 +709,8 @@ async function resolveTrackedUrl(inputUrl, args) {
         inputUrl,
         resolvedUrl: inputUrl,
         usedTrackingResolution: true,
+        preResolveAttempted: true,
+        preResolveSucceeded: false,
         trackingStatus: response.status,
         trackingResolutionError:
           "Tracker pre-resolution landed on Wiley cookieAbsent endpoint; ignoring and falling back to browser navigation.",
@@ -699,6 +720,8 @@ async function resolveTrackedUrl(inputUrl, args) {
       inputUrl,
       resolvedUrl,
       usedTrackingResolution: true,
+      preResolveAttempted: true,
+      preResolveSucceeded: true,
       trackingStatus: response.status,
       trackingResolutionError: "",
     };
@@ -707,6 +730,8 @@ async function resolveTrackedUrl(inputUrl, args) {
       inputUrl,
       resolvedUrl: inputUrl,
       usedTrackingResolution: true,
+      preResolveAttempted: true,
+      preResolveSucceeded: false,
       trackingResolutionError: String(error?.message || error),
     };
   }
@@ -1164,6 +1189,57 @@ function uniqueStrings(values) {
     out.push(cleaned);
   }
   return out;
+}
+
+function normalizeInputEntry(value) {
+  if (!value) return null;
+  if (typeof value === "string") {
+    const url = cleanText(value);
+    return url ? { url, text: "", candidateKind: "", sourceContext: "", candidateScore: 0 } : null;
+  }
+  if (typeof value !== "object") return null;
+  const url = cleanText(value.url || value.href || value.sourceUrl || value.doiUrl || "");
+  if (!url) return null;
+  const scoreNumber = Number(value.candidateScore);
+  return {
+    url,
+    text: cleanText(value.text || value.anchorText || ""),
+    candidateKind: cleanText(value.candidateKind || ""),
+    sourceContext: cleanText(value.sourceContext || ""),
+    candidateScore: Number.isFinite(scoreNumber) ? scoreNumber : 0,
+  };
+}
+
+function dedupeInputEntries(values) {
+  const deduped = [];
+  const seen = new Map();
+  for (const rawValue of values || []) {
+    const entry = normalizeInputEntry(rawValue);
+    if (!entry) continue;
+    const key = entry.url;
+    const previousIndex = seen.get(key);
+    if (previousIndex == null) {
+      seen.set(key, deduped.length);
+      deduped.push(entry);
+      continue;
+    }
+    const previous = deduped[previousIndex];
+    if ((entry.candidateScore || 0) > (previous.candidateScore || 0)) {
+      deduped[previousIndex] = {
+        ...previous,
+        ...entry,
+      };
+      continue;
+    }
+    deduped[previousIndex] = {
+      ...previous,
+      text: previous.text || entry.text,
+      candidateKind: previous.candidateKind || entry.candidateKind,
+      sourceContext: previous.sourceContext || entry.sourceContext,
+      candidateScore: Math.max(previous.candidateScore || 0, entry.candidateScore || 0),
+    };
+  }
+  return deduped;
 }
 
 function isScienceDirectLikeUrl(rawUrl) {
@@ -1740,35 +1816,27 @@ async function readInputUrls(inputPath) {
   const raw = await fs.readFile(inputPath, "utf-8");
   const parsed = JSON.parse(raw);
 
-  const urls = [];
+  const entries = [];
   const blockedByGuard = new Set();
-  const pushUrl = (value) => {
-    const url = cleanText(value);
-    if (!url) return;
-    const unsafeReason = classifyUnsafePreNavigationLink(url);
+  const pushEntry = (value, extra = {}) => {
+    const entry = normalizeInputEntry(typeof value === "string" ? { url: value, ...extra } : { ...value, ...extra });
+    if (!entry) return;
+    const unsafeReason = classifyUnsafePreNavigationLink(entry.url, entry.text);
     if (unsafeReason) {
-      blockedByGuard.add(`${url}::${unsafeReason}`);
+      blockedByGuard.add(`${entry.url}::${unsafeReason}`);
       return;
     }
-    urls.push(url);
+    entries.push(entry);
   };
   const pushLinkDetail = (entry) => {
     if (!entry || typeof entry !== "object") return;
-    const href = cleanText(entry.href || entry.url || "");
-    const text = cleanText(entry.text || entry.anchorText || "");
-    if (!href) return;
-    const unsafeReason = classifyUnsafePreNavigationLink(href, text);
-    if (unsafeReason) {
-      blockedByGuard.add(`${href}::${unsafeReason}`);
-      return;
-    }
-    urls.push(href);
+    pushEntry(entry);
   };
 
   const ingest = (node) => {
     if (!node) return;
     if (typeof node === "string") {
-      pushUrl(node);
+      pushEntry(node);
       return;
     }
     if (Array.isArray(node)) {
@@ -1788,16 +1856,16 @@ async function readInputUrls(inputPath) {
         for (const entry of node.link_details) pushLinkDetail(entry);
       }
       if (!hasEmbeddedLinks) {
-        pushUrl(node.url);
+        pushEntry(node.url, node);
+        pushEntry(node.href, node);
+        pushEntry(node.sourceUrl, node);
+        pushEntry(node.doiUrl, node);
       }
-      pushUrl(node.href);
-      pushUrl(node.sourceUrl);
-      pushUrl(node.doiUrl);
       if (Array.isArray(node.urls)) {
-        for (const u of node.urls) pushUrl(u);
+        for (const u of node.urls) pushEntry(u, node);
       }
       if (!consumedLinkDetails && Array.isArray(node.links)) {
-        for (const u of node.links) pushUrl(u);
+        for (const u of node.links) pushEntry(u, node);
       }
       if (Array.isArray(node.records)) ingest(node.records);
       if (Array.isArray(node.results)) ingest(node.results);
@@ -1805,7 +1873,7 @@ async function readInputUrls(inputPath) {
   };
 
   ingest(parsed);
-  return uniqueStrings(urls);
+  return dedupeInputEntries(entries);
 }
 
 async function detectChallenge(page) {
@@ -2369,7 +2437,31 @@ async function runVerificationPass(urls, args, seenFinalUrls = new Set()) {
   };
 }
 
-function buildExcludedLinkRecord(inputUrl, finalUrl, policy, reason, resolvedTracking) {
+function buildTrackingInfo(resolvedTracking, inputUrl, fallbackUrl, browserFinalUrl = "") {
+  const resolvedUrl = resolvedTracking?.resolvedUrl || fallbackUrl || inputUrl;
+  const browserRecovered = Boolean(
+    browserFinalUrl &&
+      normalizeFinalUrlForRunDedupe(browserFinalUrl) !== normalizeFinalUrlForRunDedupe(resolvedUrl)
+  );
+  return {
+    usedResolution: Boolean(resolvedTracking?.preResolveSucceeded ?? resolvedTracking?.usedTrackingResolution),
+    sourceUrl: resolvedTracking?.inputUrl || inputUrl,
+    resolvedUrl,
+    statusCode: resolvedTracking?.trackingStatus || null,
+    error: resolvedTracking?.trackingResolutionError || "",
+    preResolveAttempted: Boolean(
+      resolvedTracking?.preResolveAttempted ?? resolvedTracking?.usedTrackingResolution
+    ),
+    preResolveSucceeded: Boolean(
+      resolvedTracking?.preResolveSucceeded ?? resolvedTracking?.usedTrackingResolution
+    ),
+    preResolveError: resolvedTracking?.trackingResolutionError || "",
+    browserNavigationRecovered: browserRecovered,
+    browserFinalUrl: browserFinalUrl || "",
+  };
+}
+
+function buildExcludedLinkRecord(inputUrl, finalUrl, policy, reason, resolvedTracking, inputMeta = null) {
   const maybeDoi = normalizeDoi(finalUrl) || normalizeDoi(inputUrl);
   return {
     sourceUrl: inputUrl,
@@ -2398,18 +2490,15 @@ function buildExcludedLinkRecord(inputUrl, finalUrl, policy, reason, resolvedTra
       protected: Boolean(policy?.protected),
     },
     resolvedUrl: finalUrl || inputUrl,
-    tracking: {
-      usedResolution: Boolean(resolvedTracking?.usedTrackingResolution),
-      sourceUrl: resolvedTracking?.inputUrl || inputUrl,
-      resolvedUrl: resolvedTracking?.resolvedUrl || finalUrl || inputUrl,
-      statusCode: resolvedTracking?.trackingStatus || null,
-      error: resolvedTracking?.trackingResolutionError || "",
-    },
+    tracking: buildTrackingInfo(resolvedTracking, inputUrl, finalUrl || inputUrl),
+    inputLinkText: inputMeta?.text || "",
+    inputCandidateKind: inputMeta?.candidateKind || "",
+    inputSourceContext: inputMeta?.sourceContext || "",
     verifiedAt: new Date().toISOString(),
   };
 }
 
-async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolvedTracking, args) {
+async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolvedTracking, args, inputMeta = null) {
   const fetchTargets = uniqueStrings([
     canonicalScienceDirectArticleUrl(targetUrl),
     targetUrl,
@@ -2437,13 +2526,14 @@ async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolved
         protected: Boolean(policy.protected),
       };
       record.resolvedUrl = fetched.effectiveUrl || fetchTarget;
-      record.tracking = {
-        usedResolution: resolvedTracking.usedTrackingResolution,
-        sourceUrl: resolvedTracking.inputUrl,
-        resolvedUrl: resolvedTracking.resolvedUrl,
-        statusCode: resolvedTracking.trackingStatus || null,
-        error: resolvedTracking.trackingResolutionError || "",
-      };
+      record.tracking = buildTrackingInfo(
+        resolvedTracking,
+        sourceUrl,
+        fetched.effectiveUrl || fetchTarget
+      );
+      record.inputLinkText = inputMeta?.text || "";
+      record.inputCandidateKind = inputMeta?.candidateKind || "";
+      record.inputSourceContext = inputMeta?.sourceContext || "";
       record.retrieval = {
         mode: "curl_sciencedirect",
         fetchedUrl: fetchTarget,
@@ -2466,7 +2556,10 @@ async function verifyScienceDirectViaCurl(sourceUrl, targetUrl, policy, resolved
   return { ok: false, errors };
 }
 
-async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null) {
+async function verifySingleUrl(getContext, inputEntry, args, seenFinalUrls = null) {
+  const entry = normalizeInputEntry(inputEntry);
+  const inputUrl = entry?.url || cleanText(inputEntry);
+  const inputMeta = entry || { url: inputUrl, text: "", candidateKind: "", sourceContext: "", candidateScore: 0 };
   const canonical = normalizeDoi(inputUrl);
   const targets = uniqueStrings([inputUrl, canonical]);
   const backoffMs = [2000, 5000, 10000];
@@ -2484,7 +2577,27 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
             rawTargetUrl,
             policyForUrl(rawTargetUrl),
             unsafeInputReason,
-            null
+            null,
+            inputMeta
+          ),
+        };
+      }
+
+      const likelyTrackedNonArticleReason = classifyLikelyTrackedNonArticleInput(
+        rawTargetUrl,
+        inputMeta.text,
+        inputMeta.candidateKind
+      );
+      if (likelyTrackedNonArticleReason) {
+        return {
+          ok: true,
+          record: buildExcludedLinkRecord(
+            inputUrl,
+            rawTargetUrl,
+            policyForUrl(rawTargetUrl),
+            likelyTrackedNonArticleReason,
+            null,
+            inputMeta
           ),
         };
       }
@@ -2499,7 +2612,14 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
         rememberFinalUrl(seenFinalUrls, targetUrl);
         return {
           ok: true,
-          record: buildExcludedLinkRecord(inputUrl, targetUrl, policy, unsafeResolvedReason, resolved),
+          record: buildExcludedLinkRecord(
+            inputUrl,
+            targetUrl,
+            policy,
+            unsafeResolvedReason,
+            resolved,
+            inputMeta
+          ),
         };
       }
       if (shouldSkipDuplicateFinalUrl(seenFinalUrls, targetUrl, inputUrl)) {
@@ -2510,7 +2630,8 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
             targetUrl,
             policy,
             "duplicate_final_url_in_batch",
-            resolved
+            resolved,
+            inputMeta
           ),
         };
       }
@@ -2519,7 +2640,14 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
         rememberFinalUrl(seenFinalUrls, targetUrl);
         return {
           ok: true,
-          record: buildExcludedLinkRecord(inputUrl, targetUrl, policy, nonArticleReason, resolved),
+          record: buildExcludedLinkRecord(
+            inputUrl,
+            targetUrl,
+            policy,
+            nonArticleReason,
+            resolved,
+            inputMeta
+          ),
         };
       }
 
@@ -2536,7 +2664,8 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
           targetUrl,
           policy,
           resolved,
-          args
+          args,
+          inputMeta
         );
         if (curlResult.ok) {
           if (
@@ -2558,7 +2687,8 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
                   curlResult.record.resolvedUrl || curlResult.record.finalUrl || targetUrl,
                   policyForUrl(curlResult.record.resolvedUrl || curlResult.record.finalUrl || targetUrl),
                   "duplicate_final_url_in_batch",
-                  resolved
+                  resolved,
+                  inputMeta
                 ),
               };
             }
@@ -2634,7 +2764,8 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
             navigatedUrl || targetUrl,
             effectivePolicy,
             "duplicate_final_url_in_batch",
-            resolved
+            resolved,
+            inputMeta
           );
           await page.close();
           return { ok: true, record };
@@ -2647,7 +2778,8 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
             navigatedUrl || targetUrl,
             effectivePolicy,
             nonArticleAfterNav,
-            resolved
+            resolved,
+            inputMeta
           );
           await page.close();
           return { ok: true, record };
@@ -2659,13 +2791,15 @@ async function verifySingleUrl(getContext, inputUrl, args, seenFinalUrls = null)
           protected: Boolean(effectivePolicy.protected),
         };
         record.resolvedUrl = navigatedUrl || targetUrl;
-        record.tracking = {
-          usedResolution: resolved.usedTrackingResolution,
-          sourceUrl: resolved.inputUrl,
-          resolvedUrl: resolved.resolvedUrl,
-          statusCode: resolved.trackingStatus || null,
-          error: resolved.trackingResolutionError || "",
-        };
+        record.tracking = buildTrackingInfo(
+          resolved,
+          inputUrl,
+          navigatedUrl || targetUrl,
+          navigatedUrl || targetUrl
+        );
+        record.inputLinkText = inputMeta.text || "";
+        record.inputCandidateKind = inputMeta.candidateKind || "";
+        record.inputSourceContext = inputMeta.sourceContext || "";
         record.verifiedAt = new Date().toISOString();
         record.navigationResolved = Boolean(
           navigatedUrl && normalizeFinalUrlForRunDedupe(navigatedUrl) !== normalizeFinalUrlForRunDedupe(targetUrl)
@@ -2780,9 +2914,9 @@ async function main() {
     process.exit(1);
   }
 
-  const directUrls = uniqueStrings(args.urls);
+  const directUrls = dedupeInputEntries(args.urls || []);
   const fileUrls = args.input ? await readInputUrls(args.input) : [];
-  const urls = uniqueStrings([...directUrls, ...fileUrls]);
+  const urls = dedupeInputEntries([...directUrls, ...fileUrls]);
   if (!urls.length) {
     throw new Error("No URLs found after parsing inputs.");
   }
@@ -2866,11 +3000,13 @@ async function main() {
 export {
   classifyArticleType,
   classifyKnownNonArticleLink,
+  classifyLikelyTrackedNonArticleInput,
   isTrackingUrl,
   normalizeArticleTypeValue,
   parseAuthorName,
   parseAuthorList,
   formatApaAuthorFromStructured,
+  readInputUrls,
 };
 
 const IS_MAIN = (() => {

@@ -26,6 +26,8 @@ Use these scripts under `scripts/` to standardize the workflow:
 
 1. `scripts/find_gmail_message.py`
    - Finds an exact Gmail message by subject + received minute, or by subject + received date (`--received-on` date-only mode).
+   - Normalizes common forwarded/reply wrappers (`Fw:`, `Fwd:`, `Re:`) for diagnostics while preserving the exact outer Gmail subject for matching.
+   - Extracts forwarded-original metadata from forwarded messages when present (`forwardedOriginalSubject`, `forwardedOriginalSender`, `forwardedOriginalDate`) and marks `messageKind = direct|forwarded`.
    - Accepts exact subject matching with trailing punctuation normalization (for example user input omits a terminal period shown in Gmail UI/Atom).
    - Supports optional sender validation (`--sender`) in both Atom and Playwright fallback paths.
    - Uses Atom feed with browser cookies first, then optional Playwright session fallback.
@@ -49,6 +51,7 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Emits phase progress checkpoints during long Playwright runs (for example candidate row/open/extract phases) to `<output>.partial.json` when `--output` is set.
    - Adds row-open retries and extraction-phase warnings so a single Gmail thread/render failure does not abort an entire strategy attempt.
    - Auto-expands Gmail clipped-message webview links (`mail.google.com ... view=lg&permmsgid=...`, shown as `[Message clipped] View entire message`) inside the same authenticated Gmail session and merges hidden links/body text into the extracted candidate.
+   - Adds per-link provenance/scoring metadata (`sourceContext`, `candidateKind`, `candidateScore`) so forwarded-body article links rank ahead of footer TOC/journal-home utility links before publisher verification.
    - Filters alert-management links at extraction time (`unsubscribe`, `removeAlert`, manage-alert/preferences anchors) so `links` and `link_details` are safe verification candidates by default.
    - Filters unsupported schemes (for example `mailto:`, `tel:`, `javascript:`) out of verification candidates during extraction.
    - Blocks Gmail full-message webview URLs from verification candidates after expansion (`gmail_message_webview_link`) while preserving them in `all_links` / `blocked_link_details` for audit/debugging.
@@ -59,6 +62,7 @@ Use these scripts under `scripts/` to standardize the workflow:
 2. `scripts/verify_publisher_record.mjs`
    - Verifies metadata from publisher pages with domain policy and challenge detection/retries.
    - Resolves tracked email links (for example `click.skem1.com`, `el.aom.org`, `el.wiley.com`, `links.springernature.com`) to final article URLs before verification.
+   - Understands structured helper input entries from Gmail extraction (`url`, `text`, `candidateKind`, `sourceContext`, `candidateScore`) instead of only plain URL lists.
    - Re-evaluates domain policy after browser navigation/redirects (for example DOI -> Wiley final URL) so publisher-specific selectors still apply on the actual article page.
    - Includes explicit Springer Link (`link.springer.com`) policy selectors and Springer non-article link exclusions (issue/TOC/journal-home/email utility paths).
    - Springer/JBE note: publisher `Original Paper` pages often expose comma-format author names (for example `Wang, Ziqiao`); the verifier preserves surname-first ordering when constructing APA citations.
@@ -71,6 +75,7 @@ Use these scripts under `scripts/` to standardize the workflow:
    - Accepts either a link-list JSON or the full `find_gmail_message.py` `*_match.json` output (`candidates[*]`) as verifier input.
    - Applies a hard pre-navigation guard for alert-management links (`unsubscribe`, `removeAlert`, manage-alert/preferences) before any browser navigation.
    - Applies a hard pre-navigation guard for unsupported URL schemes (for example `mailto:`) before any browser navigation.
+   - Applies early Wiley tracked-link exclusions using Gmail link context (for example forwarded-footer TOC/journal-home markers) so obvious non-article Wiley links are rejected before expensive browser work.
    - Fast-excludes known non-article links (unsubscribe/account/privacy/technology-partner) after tracked-link resolution to avoid unnecessary browser retries.
    - When input JSON includes Gmail `link_details`, uses anchor text + href to block unsubscribe/manage-alert trackers before verification ingest (prevents hidden tracker unsubscribe clicks).
    - Deduplicates repeated tracker links that converge on the same final URL within a run (for example duplicate Wiley TOC/unsubscribe links).
@@ -82,6 +87,7 @@ Use these scripts under `scripts/` to standardize the workflow:
    - In `--cdp-url` mode, reuses the existing Chrome profile context (instead of always creating a fresh context) for better challenge/cookie carryover.
    - Automatically retries Wiley challenge-blocked URLs with a fallback ladder when the initial run is headless: headless -> local CDP attach (if available) -> headed Chrome retry (manual challenge-clear window), and records fallback metadata in `fallbackRuns`.
    - Emits normalized `articleType`, `ingestDecision`, and `ingestReason` for policy-safe ingestion, plus trace fields (`articleTypeClassificationSource`, `articleTypeMatchedHint`) for auditability.
+   - Emits clearer tracking telemetry so runs can distinguish pre-resolution success from browser recovery (`preResolveAttempted`, `preResolveSucceeded`, `preResolveError`, `browserNavigationRecovered`, `browserFinalUrl`).
    - Dependency:
      - Node Playwright (`npm i playwright`) or `playwright-core`
 3. `scripts/build_notion_payload.py`

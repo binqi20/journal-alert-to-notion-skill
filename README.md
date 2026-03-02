@@ -12,6 +12,12 @@
 
 ## Recent Improvements (unreleased / post-v0.1.5)
 
+- Gmail helper now normalizes forwarded-wrapper subjects (`Fw:` / `Fwd:` / `Re:`) for diagnostics and extracts forwarded-original metadata (`messageKind`, `forwardedOriginalSubject`, `forwardedOriginalSender`, `forwardedOriginalDate`) so forwarded alerts remain auditable.
+- Gmail link extraction now adds per-link provenance/scoring (`sourceContext`, `candidateKind`, `candidateScore`) and prioritizes forwarded-body article links ahead of footer TOC/home links before verification.
+- Verifier now consumes structured Gmail helper link entries directly and applies early Wiley tracked-link exclusions for obvious forwarded footer TOC/journal-home links before browser verification.
+- Tracking telemetry now distinguishes pre-resolution success from browser recovery (`preResolveAttempted`, `preResolveSucceeded`, `preResolveError`, `browserNavigationRecovered`, `browserFinalUrl`) for cleaner Wiley debugging.
+- Added forwarded-alert regression tests (Python Gmail helper tests + Node Wiley forwarded-link filter tests).
+- Validated live against a forwarded Strategic Management Journal Early View alert on Mar 2, 2026 without navigating unsubscribe/manage-alert links.
 - Gmail helper adds list-row hydration retries and diagnostics (`ui_probe`, `list_hydration`) to avoid false `0`-row misses when the Gmail shell renders before message rows attach.
 - Gmail search validation now treats shell-present + `0` rows as an inconclusive UI state (not a trustworthy empty search) and can refresh the view once before downgrading a strategy.
 - `find_gmail_message.py` adds `--row-hydration-timeout-ms` and `--zero-row-retries` for tuning Gmail row hydration behavior.
@@ -141,10 +147,10 @@ npm test
 Run Gmail helper logic unit tests:
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_find_gmail_message_helpers.py'
+python3 -m unittest discover -s tests -p 'test*.py'
 ```
 
-These tests validate recent parser improvements plus Gmail zero-row hydration/search-validation decision logic.
+These tests validate recent parser improvements, forwarded-alert helper behavior, and Gmail zero-row hydration/search-validation decision logic.
 
 ## Troubleshooting
 
